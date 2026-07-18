@@ -1,6 +1,10 @@
-# Phase 2 (RAG/MCP) — not implemented yet, pinned here so the stub server.py is installable
+# Phase 2 (RAG/MCP)
 mcp==1.2.1
 faiss-cpu==1.9.0.post1
 sentence-transformers==3.4.1
 psycopg2-binary==2.9.10
 python-dotenv==1.0.1
+# Unpinned: mcp/sentence-transformers already pull in a compatible pydantic-settings
+# transitively — pinning it here risks the same silent-downgrade issue hit with Airflow's
+# requirements.txt (see data_pipeline/requirements.txt's comment).
+pydantic-settings

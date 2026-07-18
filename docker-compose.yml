@@ -121,8 +121,17 @@ services:
       context: .
       dockerfile: mcp_server/Dockerfile
     env_file: .env
+    # The FAISS index/chunks are build artifacts of vector_db/ingest.py, not baked into the
+    # image — bind-mounting means rebuilding the index doesn't require rebuilding the image,
+    # and `docker compose run --rm mcp_server python vector_db/ingest.py` persists its output
+    # to the host instead of being discarded with the throwaway container.
+    volumes:
+      - ./mcp_server/vector_db:/app/vector_db
     networks:
       - atc_net
+    depends_on:
+      postgis:
+        condition: service_healthy
 
   # Phase 3 — not implemented yet. Behind a profile for the same reason as mcp_server above.
   agent_orchestration:
