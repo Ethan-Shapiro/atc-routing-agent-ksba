@@ -1,0 +1,143 @@
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: data_pipeline/docker/airflow.Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB}
+    # Domain PostGIS connection, read directly via psycopg2 in the housekeeping DAGs below —
+    # a plain env var is simpler than an Airflow Connection object for a single fixed target.
+    POSTGIS_DSN: postgresql://${POSTGIS_USER}:${POSTGIS_PASSWORD}@postgis:5432/${POSTGIS_DB}
+  volumes:
+    - ./data_pipeline/dags:/opt/airflow/dags
+  networks:
+    - atc_net
+  depends_on:
+    airflow-init:
+      condition: service_completed_successfully
+
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGIS_DB}
+      POSTGRES_USER: ${POSTGIS_USER}
+      POSTGRES_PASSWORD: ${POSTGIS_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./data_pipeline/sql:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGIS_USER} -d ${POSTGIS_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - atc_net
+
+  # Deliberately a separate physical database from postgis — keeps Airflow's own schema
+  # migrations decoupled from the domain telemetry schema.
+  airflow-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB}
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+    volumes:
+      - airflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER} -d ${AIRFLOW_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - atc_net
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: data_pipeline/docker/airflow.Dockerfile
+    environment:
+      <<: *airflow-common-env
+    entrypoint: ["bash", "-c"]
+    # `airflow users create` is deliberately not run here: this image's Airflow 3.3.0 +
+    # apache-airflow-providers-fab 3.7.1 combination has `AirflowSecurityManagerV2` missing
+    # `find_role`/`get_all_roles` (an upstream auth-manager mismatch, not a project config
+    # issue), so the FAB user/role CLI commands raise AttributeError. DAG correctness doesn't
+    # depend on this — verify via `airflow dags list` / `dags test` instead. Revisit this once
+    # switching the apiserver to SimpleAuthManager or pinning a compatible fab-provider version,
+    # if/when a working web UI login is needed.
+    command: ["airflow db migrate"]
+    networks:
+      - atc_net
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: ["airflow", "api-server"]
+    ports:
+      - "8080:8080"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: ["airflow", "scheduler"]
+
+  # Airflow 3.x split DAG file parsing out of the scheduler into its own mandatory component.
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: ["airflow", "dag-processor"]
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: ["airflow", "triggerer"]
+
+  # The hot-path OpenSky ingestion service. Deliberately NOT an Airflow DAG — see README /
+  # plan notes on why sub-minute polling doesn't belong in Airflow's scheduler model.
+  opensky-poller:
+    build:
+      context: .
+      dockerfile: data_pipeline/poller/Dockerfile
+    env_file: .env
+    environment:
+      POSTGIS_HOST: postgis
+    restart: unless-stopped
+    depends_on:
+      postgis:
+        condition: service_healthy
+    networks:
+      - atc_net
+
+  # Phase 2 — not implemented yet. Behind a profile so a plain `docker compose up` doesn't
+  # try to build it.
+  mcp_server:
+    profiles: ["phase2"]
+    build:
+      context: .
+      dockerfile: mcp_server/Dockerfile
+    env_file: .env
+    networks:
+      - atc_net
+
+  # Phase 3 — not implemented yet. Behind a profile for the same reason as mcp_server above.
+  agent_orchestration:
+    profiles: ["phase3"]
+    build:
+      context: .
+      dockerfile: agent_orchestration/Dockerfile
+    env_file: .env
+    networks:
+      - atc_net
+
+networks:
+  atc_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  airflow_pgdata:

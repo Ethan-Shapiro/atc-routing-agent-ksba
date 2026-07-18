@@ -1,0 +1,7 @@
+# Phase 3 (LangGraph orchestration) — not implemented yet, pinned here so stubs are installable
+langgraph==0.2.74
+langchain-core==0.3.35
+fastapi==0.115.8
+uvicorn==0.34.0
+psycopg2-binary==2.9.10
+pydantic==2.10.6

@@ -1,0 +1,15 @@
+# Shared by the custom Airflow image and the opensky-poller service.
+#
+# The DAGs connect via raw psycopg2 (POSTGIS_DSN), not Airflow's Postgres provider/hooks, so
+# apache-airflow-providers-postgres/-common-sql are deliberately NOT listed here — pinning them
+# to a version that predates Airflow 3.3.0's own dependency floor previously caused pip to
+# silently downgrade the base image's apache-airflow from 3.3.0 to 2.11.2 during the build.
+# Same reason pydantic is left unpinned below (Airflow 3.3.0 itself requires pydantic>=2.11).
+httpx==0.28.1
+authlib==1.5.1
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+tenacity==9.0.0
+pydantic>=2.11.0
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
