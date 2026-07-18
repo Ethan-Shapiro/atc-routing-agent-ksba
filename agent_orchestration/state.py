@@ -1,8 +1,8 @@
-"""Phase 3 stub — MultiAgentATCState schema, verbatim from multi-agent_orchestration_rf_layer.md.
+"""MultiAgentATCState schema, verbatim from multi-agent_orchestration_rf_layer.md.
 
-Not wired into a graph yet. north_aircraft/south_aircraft population is planned as a direct
-ST_Contains(runway_complex.boundary, aircraft.geom) query against the table Phase 1 already
-seeds (data_pipeline/sql/004_seed_reference_data.sql).
+north_aircraft/south_aircraft are populated by nodes/observation_builder.py via a direct
+ST_Contains(runway_complex.boundary, aircraft.geom) query against the table Phase 1 seeds
+(data_pipeline/sql/004_seed_reference_data.sql).
 """
 
 from typing import Annotated, Any, TypedDict

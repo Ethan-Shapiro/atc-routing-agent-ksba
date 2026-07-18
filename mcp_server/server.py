@@ -1,19 +1,28 @@
-"""MCP protocol server exposing query_radar and query_faa_rules over stdio.
+"""MCP protocol server exposing query_radar and query_faa_rules over SSE.
 
 Tool binding over hardcoding, per README.md's guardrails — an LLM agent calls these as
 declared MCP tools rather than the orchestration layer gluing together raw SQL/vector-search
 calls itself.
+
+SSE (not stdio) is deliberate: mcp_server and agent_orchestration are separate Docker
+containers in a microservices architecture. Stdio transport only works when a client spawns
+the server as a subprocess in the same process tree — it can't cross a container boundary.
+SSE lets mcp_server run as its own long-lived service that agent_orchestration (or anything
+else on the atc_net network) connects to over HTTP.
 """
 
-import asyncio
 import json
 import logging
+from contextlib import asynccontextmanager
 
-import mcp.server.stdio
 import mcp.types as types
 import psycopg2
+import uvicorn
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.routing import Mount, Route
 
 from config import settings
 from tools.query_faa_rules import FaaRulesIndex, query_faa_rules
@@ -87,17 +96,14 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=json.dumps(result, default=str))]
 
 
-async def main() -> None:
-    global _faa_index, _pg_conn
+sse_transport = SseServerTransport("/messages/")
 
-    log.info("Loading FAISS index...")
-    _faa_index = FaaRulesIndex()
 
-    log.info("Connecting to PostGIS...")
-    _pg_conn = psycopg2.connect(settings.postgres_dsn)
-
-    log.info("Starting MCP stdio server")
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+async def handle_sse(request):
+    async with sse_transport.connect_sse(request.scope, request.receive, request._send) as (
+        read_stream,
+        write_stream,
+    ):
         await server.run(
             read_stream,
             write_stream,
@@ -112,5 +118,32 @@ async def main() -> None:
         )
 
 
+async def healthcheck(request):
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
+
+
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    global _faa_index, _pg_conn
+    log.info("Loading FAISS index...")
+    _faa_index = FaaRulesIndex()
+    log.info("Connecting to PostGIS...")
+    _pg_conn = psycopg2.connect(settings.postgres_dsn)
+    log.info("mcp_server ready on /sse")
+    yield
+
+
+app = Starlette(
+    routes=[
+        Route("/health", endpoint=healthcheck),
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=sse_transport.handle_post_message),
+    ],
+    lifespan=lifespan,
+)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    uvicorn.run(app, host="0.0.0.0", port=8001)

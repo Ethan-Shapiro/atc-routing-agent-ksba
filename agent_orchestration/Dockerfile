@@ -1,5 +1,5 @@
-# Phase 3 (LangGraph orchestration) — stub only. Not built by a plain `docker compose up` (see
-# profiles in docker-compose.yml). Fill in once agent_orchestration/main.py has a real FastAPI app.
+# Phase 3 (LangGraph orchestration). Not built by a plain `docker compose up` — see profiles
+# in docker-compose.yml.
 FROM python:3.12-slim
 
 WORKDIR /app

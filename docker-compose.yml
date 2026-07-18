@@ -113,10 +113,11 @@ services:
     networks:
       - atc_net
 
-  # Phase 2 — not implemented yet. Behind a profile so a plain `docker compose up` doesn't
-  # try to build it.
+  # Phase 2 — behind a profile so a plain `docker compose up` doesn't try to build it.
+  # Runs as a long-lived SSE service (not stdio) so agent_orchestration, a separate
+  # container, can reach it over atc_net rather than needing to spawn it as a subprocess.
   mcp_server:
-    profiles: ["phase2"]
+    profiles: ["phase2", "phase3"]
     build:
       context: .
       dockerfile: mcp_server/Dockerfile
@@ -127,21 +128,38 @@ services:
     # to the host instead of being discarded with the throwaway container.
     volumes:
       - ./mcp_server/vector_db:/app/vector_db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
     networks:
       - atc_net
     depends_on:
       postgis:
         condition: service_healthy
 
-  # Phase 3 — not implemented yet. Behind a profile for the same reason as mcp_server above.
+  # Phase 3 — behind a profile for the same reason as mcp_server above. Also listed under
+  # mcp_server's profiles (above) so `docker compose --profile phase3 up` brings both up
+  # together — agent_orchestration is a real MCP client of mcp_server, not optional.
   agent_orchestration:
     profiles: ["phase3"]
     build:
       context: .
       dockerfile: agent_orchestration/Dockerfile
     env_file: .env
+    environment:
+      MCP_SERVER_URL: http://mcp_server:8001/sse
+    ports:
+      - "8000:8000"
     networks:
       - atc_net
+    depends_on:
+      postgis:
+        condition: service_healthy
+      mcp_server:
+        condition: service_healthy
 
 networks:
   atc_net:

@@ -1,7 +1,16 @@
-# Phase 3 (LangGraph orchestration) — not implemented yet, pinned here so stubs are installable
-langgraph==0.2.74
-langchain-core==0.3.35
+# Phase 3 (LangGraph orchestration)
+#
+# langgraph/langchain-anthropic are left unpinned so pip resolves a mutually-compatible
+# langchain-core for both, rather than risking the same silent-downgrade issue hit with
+# Airflow's requirements.txt (see data_pipeline/requirements.txt's comment) by pinning an
+# old langchain-core alongside them.
+langgraph
+langchain-anthropic
+# Pinned to match mcp_server/requirements.txt's version for SDK behavior parity between
+# this MCP client and the server it talks to.
+mcp==1.2.1
 fastapi==0.115.8
 uvicorn==0.34.0
-psycopg2-binary==2.9.10
-pydantic==2.10.6
+asyncpg==0.30.0
+pydantic-settings
+python-dotenv==1.0.1
