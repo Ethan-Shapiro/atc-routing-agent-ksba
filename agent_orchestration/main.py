@@ -48,7 +48,12 @@ async def _run_graph_for_anomaly(anomaly_id: int) -> dict:
         raise HTTPException(404, f"anomaly_events.id={anomaly_id} not found")
     initial_state["active_anomalies"][0]["aircraft_icao24_1"] = row["aircraft_icao24_1"]
 
-    final_state = await graph.ainvoke(initial_state)
+    # Hard safety net, not just a workaround: a reasoning loop that never terminates (model
+    # keeps re-requesting coordination, keeps calling tools, etc.) should fail fast and loud
+    # rather than run indefinitely — this is exactly the kind of runaway-cost/runaway-action
+    # failure mode a deterministic cap protects against, consistent with the project's own
+    # "deterministic safety guardrails" guardrail.
+    final_state = await graph.ainvoke(initial_state, config={"recursion_limit": 12})
     return final_state
 
 

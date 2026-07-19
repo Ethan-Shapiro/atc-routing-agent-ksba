@@ -54,8 +54,13 @@ def _multi_agent_router(state: MultiAgentATCState) -> str:
     if mcp_tool_calls:
         return "tool_executor"
 
+    # requires_coordination is the sole guard, and it's reliable: inter_agent_comm_handler
+    # clears it to False on resolution. (An earlier version additionally checked
+    # `active_agent != "COORDINATOR"` — but reasoning_node unconditionally overwrites
+    # active_agent to its own name on every call, silently clobbering that guard before the
+    # router ever saw it, which caused an infinite reasoning <-> comm_handler loop.)
     buffer = state.get("inter_agent_buffer") or {}
-    if buffer.get("requires_coordination") and state["active_agent"] != "COORDINATOR":
+    if buffer.get("requires_coordination"):
         return "inter_agent_comm_handler"
 
     return END

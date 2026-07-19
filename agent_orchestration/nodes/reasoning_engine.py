@@ -37,12 +37,20 @@ the applicable minimums rather than guessing — you cannot reliably do spatial/
 math from memory.
 - Use `query_radar` to check an aircraft's current state before acting on it.
 - If no action is needed, say so briefly and stop — do not narrate what you are not doing.
+- Once you have gathered the information you need and decided on (or explicitly ruled out) \
+an action, give your final response as plain text with NO further tool calls. A coordination \
+request that has already reached ACK or COUNTER_PROPOSAL status (see below) is resolved —
+do not call `{tool_name}` again for the same aircraft; either proceed (on ACK) or state why \
+you are holding (on COUNTER_PROPOSAL) and stop.
 
 Current {agent_name} aircraft:
 {aircraft_json}
 
 Active anomalies (all complexes):
 {anomalies_json}
+
+Current inter-agent coordination status (empty if none pending or resolved this turn):
+{coordination_json}
 """
 
 
@@ -91,15 +99,16 @@ def make_reasoning_node(
                 tool_name=REQUEST_COORDINATION_TOOL_NAME,
                 aircraft_json=json.dumps(state.get(aircraft_key, []), default=str),
                 anomalies_json=json.dumps(state.get("active_anomalies", []), default=str),
+                coordination_json=json.dumps(state.get("inter_agent_buffer") or {}, default=str),
             )
         )
         response: AIMessage = await llm_with_tools.ainvoke([system, *state["messages"]])
 
         update: dict[str, Any] = {"messages": [response], "active_agent": agent_name}
 
-        coordination_calls = [
-            tc for tc in (response.tool_calls or []) if tc["name"] == REQUEST_COORDINATION_TOOL_NAME
-        ]
+        all_calls = response.tool_calls or []
+        coordination_calls = [tc for tc in all_calls if tc["name"] == REQUEST_COORDINATION_TOOL_NAME]
+
         if coordination_calls:
             call = coordination_calls[0]
             args = call["args"]
@@ -119,13 +128,28 @@ def make_reasoning_node(
             }
             # Acknowledge the tool call locally so the message history stays valid for the
             # next LLM turn — this tool is handled here, never sent to tool_executor.
-            update["messages"] = [
-                response,
+            tool_messages = [
                 ToolMessage(
                     content=f"Coordination request recorded, awaiting ACK from {args['target_agent']}.",
                     tool_call_id=call["id"],
-                ),
+                )
             ]
+            # Defensive: Anthropic allows parallel tool calls, so the model may have asked
+            # for query_radar/query_faa_rules in the SAME turn as request_coordination. Every
+            # tool_use block needs exactly one tool_result before the next API call, but this
+            # turn is being diverted to inter_agent_comm_handler instead of tool_executor — so
+            # answer any other pending calls with a deferred placeholder rather than leaving
+            # them unanswered (which would 400 the next call the same way the missing
+            # coordination result did).
+            for tc in all_calls:
+                if tc["name"] != REQUEST_COORDINATION_TOOL_NAME:
+                    tool_messages.append(
+                        ToolMessage(
+                            content="Deferred — coordination request takes precedence this turn.",
+                            tool_call_id=tc["id"],
+                        )
+                    )
+            update["messages"] = [response, *tool_messages]
 
         return update
 

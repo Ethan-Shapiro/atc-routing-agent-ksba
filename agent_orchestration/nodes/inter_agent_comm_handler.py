@@ -10,7 +10,7 @@ on its next turn.
 from typing import Any, Callable, Coroutine
 
 import asyncpg
-from langchain_core.messages import AIMessage
+from langchain_core.messages import HumanMessage
 
 from state import MultiAgentATCState
 
@@ -48,13 +48,28 @@ def make_inter_agent_comm_handler(
             status = "ACK"
             note = "No conflicting traffic within separation minimums at the crossing point."
 
-        updated_buffer = {**buffer, "coordination_status": status, "verification_note": note}
+        # requires_coordination flips to False here — this is the router's actual signal
+        # that this request is resolved. Don't rely on active_agent for that instead: the
+        # reasoning node unconditionally overwrites active_agent to its own name on every
+        # call, so a guard based on active_agent gets silently clobbered before the router
+        # ever sees it (the bug that caused the original infinite loop).
+        updated_buffer = {
+            **buffer,
+            "requires_coordination": False,
+            "coordination_status": status,
+            "verification_note": note,
+        }
 
         return {
             "inter_agent_buffer": updated_buffer,
             "active_agent": "COORDINATOR",
+            # HumanMessage, not AIMessage: this is new information delivered TO the origin
+            # agent for its next turn, not something the agent itself said. An AIMessage
+            # here would leave the conversation ending in an assistant turn when the
+            # origin agent's reasoning node calls the LLM again next — Claude Sonnet 5
+            # rejects that as an unsupported assistant-message prefill (400).
             "messages": [
-                AIMessage(
+                HumanMessage(
                     content=(
                         f"[{buffer['target_agent']} verification for {aircraft_id}] "
                         f"{status}: {note}"
