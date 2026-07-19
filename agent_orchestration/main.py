@@ -35,6 +35,7 @@ async def _run_graph_for_anomaly(anomaly_id: int) -> dict:
         "north_aircraft": [],
         "south_aircraft": [],
         "inter_agent_buffer": {},
+        "final_instruction": None,
         # observation_builder overwrites this with the live open-anomaly list, but the
         # entry router needs a hint about *which* anomaly triggered this run, so seed it.
         "active_anomalies": [{"id": anomaly_id, "aircraft_icao24_1": None}],
@@ -93,7 +94,14 @@ async def startup() -> None:
     _state["mcp_client"] = mcp_client
     mcp_tools = build_langchain_tools(mcp_client)
 
-    llm = ChatAnthropic(model=settings.llm_model, api_key=settings.anthropic_api_key)
+    # max_tokens is deliberately generous, not the 4096 LangChain default: Claude Sonnet 5
+    # runs adaptive thinking by default even without an explicit `thinking` param, and
+    # thinking + the tool-heavy system prompt + the actual response all share one budget.
+    # A tight budget risks the model's real decision (text or a finalize_instruction call)
+    # being silently truncated to nothing after thinking consumes most of it — observed live
+    # during Phase 4 integration testing: a turn ended with an empty thinking block and no
+    # text or tool call, on an anomaly with an unambiguous, active 0.28 NM conflict.
+    llm = ChatAnthropic(model=settings.llm_model, api_key=settings.anthropic_api_key, max_tokens=16000)
 
     _state["graph"] = build_graph(llm, mcp_tools, _state["pool"])
     _state["listener_task"] = asyncio.create_task(_listen_for_anomalies())

@@ -19,8 +19,21 @@ from langgraph.prebuilt import ToolNode
 
 from nodes.inter_agent_comm_handler import make_inter_agent_comm_handler
 from nodes.observation_builder import make_observation_builder
-from nodes.reasoning_engine import REQUEST_COORDINATION_TOOL_NAME, make_reasoning_node
+from nodes.phraseology_generator import (
+    PhraseologyBackend,
+    TemplatePhraseologyBackend,
+    make_phraseology_generator,
+)
+from nodes.reasoning_engine import (
+    FINALIZE_INSTRUCTION_TOOL_NAME,
+    REQUEST_COORDINATION_TOOL_NAME,
+    make_reasoning_node,
+)
 from state import MultiAgentATCState
+
+# Tool names the reasoning node intercepts inline (see reasoning_engine.py) rather than
+# routing to tool_executor — anything else in a response's tool_calls is a real MCP call.
+_INLINE_HANDLED_TOOL_NAMES = {REQUEST_COORDINATION_TOOL_NAME, FINALIZE_INSTRUCTION_TOOL_NAME}
 
 
 def _entry_router(state: MultiAgentATCState) -> str:
@@ -48,11 +61,17 @@ def _multi_agent_router(state: MultiAgentATCState) -> str:
     last_message = state["messages"][-1]
 
     tool_calls = getattr(last_message, "tool_calls", None) or []
-    # request_coordination is handled inline by the reasoning node, never routed to
-    # tool_executor — only MCP tool calls (query_radar/query_faa_rules) reach it here.
-    mcp_tool_calls = [tc for tc in tool_calls if tc["name"] != REQUEST_COORDINATION_TOOL_NAME]
+    # request_coordination and finalize_instruction are both handled inline by the reasoning
+    # node, never routed to tool_executor — only real MCP calls (query_radar/query_faa_rules)
+    # reach it here.
+    mcp_tool_calls = [tc for tc in tool_calls if tc["name"] not in _INLINE_HANDLED_TOOL_NAMES]
     if mcp_tool_calls:
         return "tool_executor"
+
+    # A finalized instruction takes priority over END: the reasoning node has decided on a
+    # concrete action and needs it rendered into phraseology before this turn is done.
+    if state.get("final_instruction"):
+        return "phraseology_generator"
 
     # requires_coordination is the sole guard, and it's reliable: inter_agent_comm_handler
     # clears it to False on resolution. (An earlier version additionally checked
@@ -79,6 +98,7 @@ def build_graph(
     llm: BaseChatModel,
     mcp_tools: list[StructuredTool],
     pool: asyncpg.Pool,
+    phraseology_backend: PhraseologyBackend | None = None,
 ):
     graph = StateGraph(MultiAgentATCState)
 
@@ -87,6 +107,10 @@ def build_graph(
     graph.add_node("south_reasoning", make_reasoning_node("SOUTH_TOWER", llm, mcp_tools))
     graph.add_node("tool_executor", ToolNode(mcp_tools))
     graph.add_node("inter_agent_comm_handler", make_inter_agent_comm_handler(pool))
+    graph.add_node(
+        "phraseology_generator",
+        make_phraseology_generator(phraseology_backend or TemplatePhraseologyBackend()),
+    )
 
     graph.set_entry_point("observation_builder")
     graph.add_conditional_edges(
@@ -101,6 +125,7 @@ def build_graph(
             _multi_agent_router,
             {
                 "tool_executor": "tool_executor",
+                "phraseology_generator": "phraseology_generator",
                 "inter_agent_comm_handler": "inter_agent_comm_handler",
                 END: END,
             },
@@ -116,5 +141,7 @@ def build_graph(
         _route_back_to_origin_agent,
         {"north_reasoning": "north_reasoning", "south_reasoning": "south_reasoning"},
     )
+    # Terminal: phraseology has been generated, the turn is done.
+    graph.add_edge("phraseology_generator", END)
 
     return graph.compile()

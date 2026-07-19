@@ -6,6 +6,13 @@ agent calls the `request_coordination` tool instead of acting directly — this 
 inter_agent_buffer with the JSON contract from multi-agent_orchestration_rf_layer.md and hands
 control to inter_agent_comm_handler via the conditional router, requiring an ACK from the
 opposing agent before any phraseology is generated.
+
+Phase 4 hybrid split: once the agent has decided on a concrete action, it calls
+`finalize_instruction` with structured fields (aircraft, command type, value) instead of
+writing phraseology itself. nodes/phraseology_generator.py renders that structured decision
+into FAA phraseology text as a separate step — today via a deterministic template, later via
+the fine-tuned model — without this reasoning node or its tool-use/coordination logic
+changing at all.
 """
 
 import json
@@ -20,6 +27,7 @@ from pydantic import BaseModel, Field
 from state import MultiAgentATCState
 
 REQUEST_COORDINATION_TOOL_NAME = "request_coordination"
+FINALIZE_INSTRUCTION_TOOL_NAME = "finalize_instruction"
 
 _SYSTEM_PROMPT_TEMPLATE = """You are the {agent_name} controller at LAX, responsible for \
 runways and taxiways in the {agent_name} complex only. You monitor the aircraft listed below \
@@ -36,12 +44,17 @@ phraseology for a cross-boundary action until that request has been acknowledged
 the applicable minimums rather than guessing — you cannot reliably do spatial/regulatory \
 math from memory.
 - Use `query_radar` to check an aircraft's current state before acting on it.
-- If no action is needed, say so briefly and stop — do not narrate what you are not doing.
-- Once you have gathered the information you need and decided on (or explicitly ruled out) \
-an action, give your final response as plain text with NO further tool calls. A coordination \
-request that has already reached ACK or COUNTER_PROPOSAL status (see below) is resolved —
-do not call `{tool_name}` again for the same aircraft; either proceed (on ACK) or state why \
-you are holding (on COUNTER_PROPOSAL) and stop.
+- If no action is needed, say so briefly in plain text and stop — do not narrate what you are \
+not doing, and do not call `{finalize_tool_name}`.
+- If you DO decide on a concrete instruction for an aircraft in your complex (and, for a \
+cross-boundary situation, only after coordination has reached ACK), call \
+`{finalize_tool_name}` with the structured instruction as your last step. Do not write the \
+phraseology yourself — a separate step renders your structured decision into the radio call. \
+Once you have called it, stop; do not call it twice for the same decision.
+- A coordination request that has already reached ACK or COUNTER_PROPOSAL status (see below) \
+is resolved — do not call `{tool_name}` again for the same aircraft; either proceed (on ACK, \
+by calling `{finalize_tool_name}`) or state in plain text why you are holding (on \
+COUNTER_PROPOSAL) and stop.
 
 Current {agent_name} aircraft:
 {aircraft_json}
@@ -83,13 +96,60 @@ def _build_request_coordination_tool() -> StructuredTool:
     )
 
 
+class InstructionComponent(BaseModel):
+    command_type: str = Field(
+        description="One of 'HEADING_CHANGE', 'ALTITUDE_CHANGE', 'SPEED_CHANGE' — the three "
+        "deterministic intervention types from README.md's action space."
+    )
+    value: float = Field(
+        description="Target heading in degrees (0-359) for HEADING_CHANGE, target altitude "
+        "in feet for ALTITUDE_CHANGE, or target airspeed in knots for SPEED_CHANGE."
+    )
+    direction: str | None = Field(
+        default=None,
+        description="'LEFT' or 'RIGHT' — required for HEADING_CHANGE only, the shorter turn "
+        "direction to the target heading.",
+    )
+
+
+class FinalizeInstructionInput(BaseModel):
+    aircraft_id: str = Field(description="ICAO24 hex address of the aircraft being instructed")
+    callsign: str = Field(description="The aircraft's callsign as spoken, e.g. 'Delta 123'")
+    components: list[InstructionComponent] = Field(
+        description="One or more instruction components to issue together in a single radio call"
+    )
+    read_back_required: bool = Field(
+        default=True, description="Whether the pilot must read back the instruction"
+    )
+
+
+def _build_finalize_instruction_tool() -> StructuredTool:
+    async def _noop(**kwargs) -> str:
+        # Same pattern as request_coordination's tool: intercepted inline by the reasoning
+        # node (it writes to state.final_instruction, not an external system), so this
+        # coroutine exists only to satisfy bind_tools()'s schema requirement.
+        return "handled by reasoning node"
+
+    return StructuredTool.from_function(
+        name=FINALIZE_INSTRUCTION_TOOL_NAME,
+        description=(
+            "Finalize a concrete ATC instruction for an aircraft in your complex. Call this "
+            "once you have decided what to instruct — do not write the radio phraseology "
+            "yourself, a separate rendering step handles that from your structured input."
+        ),
+        args_schema=FinalizeInstructionInput,
+        coroutine=_noop,
+    )
+
+
 def make_reasoning_node(
     agent_name: str,
     llm: BaseChatModel,
     mcp_tools: list[StructuredTool],
 ) -> Callable[[MultiAgentATCState], Coroutine[Any, Any, dict]]:
     coordination_tool = _build_request_coordination_tool()
-    llm_with_tools = llm.bind_tools([*mcp_tools, coordination_tool])
+    finalize_tool = _build_finalize_instruction_tool()
+    llm_with_tools = llm.bind_tools([*mcp_tools, coordination_tool, finalize_tool])
     aircraft_key = "north_aircraft" if agent_name == "NORTH_TOWER" else "south_aircraft"
 
     async def reasoning_node(state: MultiAgentATCState) -> dict:
@@ -97,6 +157,7 @@ def make_reasoning_node(
             content=_SYSTEM_PROMPT_TEMPLATE.format(
                 agent_name=agent_name,
                 tool_name=REQUEST_COORDINATION_TOOL_NAME,
+                finalize_tool_name=FINALIZE_INSTRUCTION_TOOL_NAME,
                 aircraft_json=json.dumps(state.get(aircraft_key, []), default=str),
                 anomalies_json=json.dumps(state.get("active_anomalies", []), default=str),
                 coordination_json=json.dumps(state.get("inter_agent_buffer") or {}, default=str),
@@ -108,7 +169,11 @@ def make_reasoning_node(
 
         all_calls = response.tool_calls or []
         coordination_calls = [tc for tc in all_calls if tc["name"] == REQUEST_COORDINATION_TOOL_NAME]
+        finalize_calls = [tc for tc in all_calls if tc["name"] == FINALIZE_INSTRUCTION_TOOL_NAME]
 
+        # Coordination takes priority: a cross-boundary action can't be finalized until it's
+        # been ACK'd, so if both were somehow called in the same turn, coordination wins and
+        # the finalize call (along with any plain MCP tool calls) is deferred to a later turn.
         if coordination_calls:
             call = coordination_calls[0]
             args = call["args"]
@@ -135,17 +200,46 @@ def make_reasoning_node(
                 )
             ]
             # Defensive: Anthropic allows parallel tool calls, so the model may have asked
-            # for query_radar/query_faa_rules in the SAME turn as request_coordination. Every
-            # tool_use block needs exactly one tool_result before the next API call, but this
-            # turn is being diverted to inter_agent_comm_handler instead of tool_executor — so
-            # answer any other pending calls with a deferred placeholder rather than leaving
-            # them unanswered (which would 400 the next call the same way the missing
-            # coordination result did).
+            # for query_radar/query_faa_rules (or finalize_instruction) in the SAME turn as
+            # request_coordination. Every tool_use block needs exactly one tool_result before
+            # the next API call, but this turn is being diverted to inter_agent_comm_handler
+            # instead of tool_executor/phraseology_generator — so answer any other pending
+            # calls with a deferred placeholder rather than leaving them unanswered (which
+            # would 400 the next call the same way the missing coordination result did).
             for tc in all_calls:
                 if tc["name"] != REQUEST_COORDINATION_TOOL_NAME:
                     tool_messages.append(
                         ToolMessage(
                             content="Deferred — coordination request takes precedence this turn.",
+                            tool_call_id=tc["id"],
+                        )
+                    )
+            update["messages"] = [response, *tool_messages]
+
+        elif finalize_calls:
+            call = finalize_calls[0]
+            args = call["args"]
+            update["final_instruction"] = {
+                "agent_name": agent_name,
+                "aircraft_id": args["aircraft_id"],
+                "callsign": args["callsign"],
+                "components": args["components"],
+                "read_back_required": args.get("read_back_required", True),
+            }
+            tool_messages = [
+                ToolMessage(
+                    content="Instruction finalized, phraseology being generated.",
+                    tool_call_id=call["id"],
+                )
+            ]
+            # Same defensive reasoning as above — a parallel MCP tool call alongside
+            # finalize_instruction needs an answer too, since this turn routes straight to
+            # phraseology_generator rather than tool_executor.
+            for tc in all_calls:
+                if tc["name"] != FINALIZE_INSTRUCTION_TOOL_NAME:
+                    tool_messages.append(
+                        ToolMessage(
+                            content="Deferred — instruction finalization takes precedence this turn.",
                             tool_call_id=tc["id"],
                         )
                     )
