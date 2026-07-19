@@ -7,6 +7,7 @@ inference. The target agent's reasoning node only sees the outcome (ACK / COUNTE
 on its next turn.
 """
 
+from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 
 import asyncpg
@@ -24,6 +25,25 @@ WHERE is_commercial_ifr = true AND icao24 != $3
 ORDER BY distance_nm ASC
 LIMIT 1
 """
+
+_INSERT_COORDINATION_EVENT_SQL = """
+INSERT INTO coordination_events (
+    origin_agent, target_agent, aircraft_icao24, action_type, coordinate_threshold,
+    estimated_time_crossing, reason, coordination_status, verification_note, requested_at
+) VALUES (
+    $1, $2, $3, $4, ST_SetSRID(ST_MakePoint($5, $6), 4326)::geography, $7, $8, $9, $10, $11
+)
+"""
+
+
+def _parse_estimated_time(value: str) -> datetime | None:
+    # The LLM supplies this as free-text "ISO 8601 timestamp estimate" — it's a plausibility
+    # estimate for the reward function's audit trail, not something safety-critical, so a
+    # malformed value is logged as NULL rather than failing the whole coordination turn.
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
 
 
 def make_inter_agent_comm_handler(
@@ -59,6 +79,26 @@ def make_inter_agent_comm_handler(
             "coordination_status": status,
             "verification_note": note,
         }
+
+        # Persisted for Phase 5's reward function — inter_agent_buffer itself is ephemeral
+        # LangGraph state and disappears when this graph run ends, so without this write
+        # R_coordination would have no durable record of what got coordinated.
+        proposed = buffer["proposed_action"]
+        async with pool.acquire() as conn:
+            await conn.execute(
+                _INSERT_COORDINATION_EVENT_SQL,
+                buffer["origin_agent"],
+                buffer["target_agent"],
+                aircraft_id,
+                proposed["type"],
+                lon,
+                lat,
+                _parse_estimated_time(proposed.get("estimated_time_crossing", "")),
+                buffer.get("reason"),
+                status,
+                note,
+                _parse_estimated_time(buffer["requested_at"]) or datetime.now(timezone.utc),
+            )
 
         return {
             "inter_agent_buffer": updated_buffer,

@@ -1,0 +1,4 @@
+# Phase 5 (offline reward scoring)
+asyncpg==0.30.0
+pydantic-settings
+python-dotenv==1.0.1

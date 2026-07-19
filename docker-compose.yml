@@ -161,6 +161,20 @@ services:
       mcp_server:
         condition: service_healthy
 
+  # Phase 5 — offline reward scoring. Not a long-lived service; run one-off via
+  # `docker compose --profile phase5 run --rm evaluation python score_episode.py ...`.
+  evaluation:
+    profiles: ["phase5"]
+    build:
+      context: .
+      dockerfile: evaluation/Dockerfile
+    env_file: .env
+    networks:
+      - atc_net
+    depends_on:
+      postgis:
+        condition: service_healthy
+
 networks:
   atc_net:
     driver: bridge
