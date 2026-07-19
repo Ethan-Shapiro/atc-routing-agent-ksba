@@ -1,22 +1,35 @@
-"""North/South Tower reasoning nodes.
+"""4-role KSBA reasoning nodes: Clearance Delivery, Ground, Tower, Approach.
 
-Strict agent boundaries (README.md guardrail): a reasoning node never issues a command to an
-aircraft outside its own jurisdiction. When an anomaly requires a cross-boundary action, the
-agent calls the `request_coordination` tool instead of acting directly — this populates
-inter_agent_buffer with the JSON contract from multi-agent_orchestration_rf_layer.md and hands
-control to inter_agent_comm_handler via the conditional router, requiring an ACK from the
-opposing agent before any phraseology is generated.
+Replaces the LAX-era North/South Tower design. Rules below are adapted directly from
+ksba_prototype/agents.py's SYSTEM_PROMPTS, which validated well against 9 isolated scenarios
+and 2 full handoff chains (see ksba_prototype/scenarios.py, chains.py). The key behavioral
+change from that prototype: instead of receiving a hand-authored "Current Airspace State"
+JSON blob in the user message, each node is bound to the real query_radar/query_faa_rules MCP
+tools and is expected to call them for live aircraft state and rule citations, rather than
+trusting whatever context happened to be in the triggering message.
 
-Phase 4 hybrid split: once the agent has decided on a concrete action, it calls
-`finalize_instruction` with structured fields (aircraft, command type, value) instead of
-writing phraseology itself. nodes/phraseology_generator.py renders that structured decision
-into FAA phraseology text as a separate step — today via a deterministic template, later via
-the fine-tuned model — without this reasoning node or its tool-use/coordination logic
-changing at all.
+Two more tools beyond the MCP pair:
+  - finalize_instruction — unchanged mechanism from the 2-agent design (see
+    nodes/phraseology_generator.py), generalized to a free-form command_type/value schema
+    since KSBA's 4 roles need a much wider instruction vocabulary (CRAFT clearance elements,
+    taxi/hold-short instructions, takeoff/landing clearance, frequency handoffs) than the old
+    3-type airborne-maneuver-only action space.
+  - advance_to_next_role — replaces the 2-agent design's request_coordination. A role hands
+    an aircraft to an EXPLICIT target_role (not an implicit "next" lookup) since KSBA's real
+    chain runs in two directions: departures go Clearance -> Ground -> Tower -> Approach,
+    arrivals go Approach -> Tower -> Ground. This does not re-invoke the target role's
+    reasoning node within the same graph run — it writes an audit row (coordination_events)
+    and the actual next radio exchange happens via a separate trigger, same as real ATC
+    handoffs happen as separate radio calls, not one continuous exchange.
+  - check_runway_conflict — Tower-only. A genuine "ask a deterministic system, then act on
+    the answer" round-trip (unlike advance_to_next_role): Tower's 2 NM intersection rule is a
+    real spatial safety threshold, and per the project's "LLMs cannot do math" guardrail
+    (already applied in nodes/handoff_handler.py), that check runs as a real PostGIS distance
+    query, not model inference. Tower's turn pauses for the verdict before it can finalize a
+    hold-short or takeoff/landing clearance decision.
 """
 
 import json
-from datetime import datetime, timezone
 from typing import Any, Callable, Coroutine
 
 from langchain_core.language_models import BaseChatModel
@@ -24,97 +37,87 @@ from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
 
-from state import MultiAgentATCState
+from roles import ROLE_FACILITY_NAME, ROLE_FREQUENCY_MHZ, ROLE_NAMES
+from state import MultiRoleATCState
 
-REQUEST_COORDINATION_TOOL_NAME = "request_coordination"
 FINALIZE_INSTRUCTION_TOOL_NAME = "finalize_instruction"
+ADVANCE_TO_NEXT_ROLE_TOOL_NAME = "advance_to_next_role"
+CHECK_RUNWAY_CONFLICT_TOOL_NAME = "check_runway_conflict"
 
-_SYSTEM_PROMPT_TEMPLATE = """You are the {agent_name} controller at LAX, responsible for \
-runways and taxiways in the {agent_name} complex only. You monitor the aircraft listed below \
-and any active safety anomalies, and decide whether an intervention is needed.
+_RULES_BY_ROLE = {
+    "CLEARANCE": """Your objective is to issue IFR route clearances to departing aircraft before they push back from the gate.
 
-Hard rules:
-- You may only reason about and act on aircraft in YOUR complex ({agent_name}). You must \
-never issue an instruction to an aircraft belonging to the other complex.
-- If an anomaly or a planned action would require an aircraft to cross into the other \
-complex's jurisdiction (e.g. a taxi crossing, a missed approach into the other complex's \
-departure path), you must call `{tool_name}` instead of acting directly. Do not generate \
-phraseology for a cross-boundary action until that request has been acknowledged.
-- Before deciding on a separation or wake-turbulence action, use `query_faa_rules` to confirm \
-the applicable minimums rather than guessing — you cannot reliably do spatial/regulatory \
-math from memory.
-- Use `query_radar` to check an aircraft's current state before acting on it.
-- If no action is needed, say so briefly in plain text and stop — do not narrate what you are \
-not doing, and do not call `{finalize_tool_name}`.
-- If you DO decide on a concrete instruction for an aircraft in your complex (and, for a \
-cross-boundary situation, only after coordination has reached ACK), call \
-`{finalize_tool_name}` with the structured instruction as your last step. Do not write the \
-phraseology yourself — a separate step renders your structured decision into the radio call. \
-Once you have called it, stop; do not call it twice for the same decision.
-- A coordination request that has already reached ACK or COUNTER_PROPOSAL status (see below) \
-is resolved — do not call `{tool_name}` again for the same aircraft; either proceed (on ACK, \
-by calling `{finalize_tool_name}`) or state in plain text why you are holding (on \
-COUNTER_PROPOSAL) and stop.
+Rules:
+1. You must follow the CRAFT format perfectly: Clearance Limit, Route, Altitude, Frequency, Transponder.
+2. For commercial jets departing Runway 7, assign the standard departure frequency 120.55 (Approach).
+3. If an aircraft calls for taxi, deny the request and instruct them to contact Ground on 121.7 — do not issue a taxi clearance yourself.
+4. Once you've decided the clearance, call finalize_instruction with one component per CRAFT element (command_type: CLEARANCE_LIMIT / ROUTE / ALTITUDE / DEPARTURE_FREQUENCY / TRANSPONDER), then call advance_to_next_role with target_role='GROUND'.""",
+    "GROUND": """Your objective is to safely route aircraft from their parking areas to the active runway thresholds without causing incursions.
 
-Current {agent_name} aircraft:
+Rules:
+1. Commercial jets (regional jets, e.g. CRJ700/ERJ) MUST be routed to Runway 7 or 25.
+2. General Aviation aircraft (C172, PA28) should be routed to Runway 15L or 15R.
+3. You must explicitly instruct aircraft to "hold short" of any intersecting runway during their taxi route, and you MUST demand a readback from the pilot.
+4. Call finalize_instruction with the taxi routing (command_type: RUNWAY_ASSIGNMENT, TAXI_ROUTE, HOLD_SHORT as separate components), then call advance_to_next_role with target_role='TOWER' once the aircraft is holding short of its departure runway — not before.""",
+    "TOWER": """Your objective is to safely sequence takeoffs and landings.
+
+CRITICAL INTERSECTION RULES:
+1. Runways 15L, 15R, 33L, and 33R physically intersect Runway 7/25 (see the `runway` table's intersects_with data).
+2. You MUST NEVER clear an aircraft for takeoff or landing on any 15/33 runway if a commercial aircraft is within 2 nautical miles of the threshold on final approach for Runway 7 or 25. Call check_runway_conflict BEFORE finalizing a takeoff or landing clearance on a 15/33 runway to verify this deterministically — do not estimate the distance yourself.
+3. If an aircraft is on the runway and a conflict occurs, immediately issue a "go-around" command via finalize_instruction (command_type: GO_AROUND).
+
+General Rules:
+1. Use standard FAA Order JO 7110.65 phraseology (e.g., "Cleared for takeoff", "Cleared to land", "Hold short") — use query_faa_rules if you need to confirm exact wording.
+2. Once an aircraft departs and passes 1,000 feet, call finalize_instruction (command_type: CONTACT_FREQUENCY, value='120.55') then advance_to_next_role with target_role='APPROACH'.
+3. For an arrival handed to you by Approach, once the aircraft has landed and vacated the runway, call finalize_instruction (command_type: CONTACT_FREQUENCY, value='121.7') then advance_to_next_role with target_role='GROUND'.
+4. If you must withhold a clearance due to a conflict, call finalize_instruction with the hold-short instruction and a traffic advisory instead — never leave a request unanswered.""",
+    "APPROACH": """Your objective is to sequence incoming IFR traffic from the en-route phase into a clean final approach line for KSBA, and to accept outbound aircraft on climb-out from Tower.
+
+Rules:
+1. You must maintain 3 miles of lateral separation or 1,000 feet of vertical separation between all targets at all times.
+2. Speed control is your primary tool. You may instruct faster jets to slow down (command_type: SPEED_CHANGE) to avoid overtaking slower propeller aircraft — vectors/altitude changes are secondary tools, not the default.
+3. Once an aircraft is established on the localizer for their assigned runway and is 5 miles out, call finalize_instruction (command_type: CONTACT_FREQUENCY, value='119.7') then advance_to_next_role with target_role='TOWER'.
+4. For a departure checking in from Tower on climb-out, acknowledge radar contact and issue further climb/routing via finalize_instruction — this is the terminal role in the departure chain, no further handoff needed.""",
+}
+
+_SYSTEM_PROMPT_TEMPLATE = """You are the {facility_name} controller at Santa Barbara Municipal Airport (KSBA), operating on frequency {frequency}.
+
+{rules}
+
+Grounding rules (apply to every role):
+- Use `query_radar` to check an aircraft's current state before acting on it, rather than trusting only what's in this message.
+- Before relying on an FAA separation/wake-turbulence/phraseology rule you're not certain of, use `query_faa_rules` to confirm it — you cannot reliably do spatial or regulatory recall from memory.
+- Respond with the exact radio phraseology you would transmit as plain text alongside your tool calls — no narration, no explanation of what you're doing, just what you would actually say over the radio, driven by what you pass to `finalize_instruction`.
+- If no action is needed yet, say so briefly in plain text and stop — do not call `finalize_instruction`.
+
+Aircraft currently in your jurisdiction:
 {aircraft_json}
 
-Active anomalies (all complexes):
+Active anomalies (all roles):
 {anomalies_json}
 
-Current inter-agent coordination status (empty if none pending or resolved this turn):
-{coordination_json}
+Current handoff/conflict-check status (empty if none pending or resolved this turn):
+{handoff_json}
 """
-
-
-class RequestCoordinationInput(BaseModel):
-    target_agent: str = Field(description="'NORTH_TOWER' or 'SOUTH_TOWER' — the other complex")
-    aircraft_id: str = Field(description="ICAO24 hex address of the aircraft requiring coordination")
-    action_type: str = Field(description="e.g. 'TAXI_CROSSING', 'MISSED_APPROACH_INTO_ADJACENT_COMPLEX'")
-    coordinate_threshold: list[float] = Field(description="[lat, lon] of the crossing point")
-    estimated_time_crossing: str = Field(description="ISO 8601 timestamp estimate")
-    reason: str = Field(description="Brief explanation of why coordination is required")
-
-
-def _build_request_coordination_tool() -> StructuredTool:
-    async def _noop(**kwargs) -> str:
-        # Never actually invoked — the reasoning node intercepts this tool call before
-        # it would reach a generic tool executor, since it mutates graph state rather
-        # than calling an external system. The coroutine exists only so bind_tools()
-        # has something schema-valid to attach.
-        return "handled by reasoning node"
-
-    return StructuredTool.from_function(
-        name=REQUEST_COORDINATION_TOOL_NAME,
-        description=(
-            "Request coordination from the other tower complex before taking any action "
-            "that would affect an aircraft crossing into their jurisdiction. Never act on "
-            "a cross-boundary situation directly."
-        ),
-        args_schema=RequestCoordinationInput,
-        coroutine=_noop,
-    )
 
 
 class InstructionComponent(BaseModel):
     command_type: str = Field(
-        description="One of 'HEADING_CHANGE', 'ALTITUDE_CHANGE', 'SPEED_CHANGE' — the three "
-        "deterministic intervention types from README.md's action space."
+        description="Free-form label for this instruction element — e.g. CLEARANCE_LIMIT, "
+        "ROUTE, ALTITUDE, DEPARTURE_FREQUENCY, TRANSPONDER, RUNWAY_ASSIGNMENT, TAXI_ROUTE, "
+        "HOLD_SHORT, TAKEOFF_CLEARANCE, LANDING_CLEARANCE, GO_AROUND, CONTACT_FREQUENCY, "
+        "HEADING_CHANGE, ALTITUDE_CHANGE, SPEED_CHANGE, TRAFFIC_ADVISORY — whatever this "
+        "role's rules call for."
     )
-    value: float = Field(
-        description="Target heading in degrees (0-359) for HEADING_CHANGE, target altitude "
-        "in feet for ALTITUDE_CHANGE, or target airspeed in knots for SPEED_CHANGE."
-    )
-    direction: str | None = Field(
-        default=None,
-        description="'LEFT' or 'RIGHT' — required for HEADING_CHANGE only, the shorter turn "
-        "direction to the target heading.",
+    value: str = Field(
+        description="The instruction detail as spoken text or a value, e.g. 'KSBA', "
+        "'SBA V25 LAX', '16000', '120.55', '4271', 'via Alpha, hold short Runway 15R/33L'."
     )
 
 
 class FinalizeInstructionInput(BaseModel):
     aircraft_id: str = Field(description="ICAO24 hex address of the aircraft being instructed")
-    callsign: str = Field(description="The aircraft's callsign as spoken, e.g. 'Delta 123'")
+    callsign: str = Field(description="The aircraft's callsign as spoken, e.g. 'SkyWest 2450'")
     components: list[InstructionComponent] = Field(
         description="One or more instruction components to issue together in a single radio call"
     )
@@ -125,16 +128,13 @@ class FinalizeInstructionInput(BaseModel):
 
 def _build_finalize_instruction_tool() -> StructuredTool:
     async def _noop(**kwargs) -> str:
-        # Same pattern as request_coordination's tool: intercepted inline by the reasoning
-        # node (it writes to state.final_instruction, not an external system), so this
-        # coroutine exists only to satisfy bind_tools()'s schema requirement.
         return "handled by reasoning node"
 
     return StructuredTool.from_function(
         name=FINALIZE_INSTRUCTION_TOOL_NAME,
         description=(
-            "Finalize a concrete ATC instruction for an aircraft in your complex. Call this "
-            "once you have decided what to instruct — do not write the radio phraseology "
+            "Finalize a concrete ATC instruction for an aircraft in your jurisdiction. Call "
+            "this once you have decided what to instruct — do not write the radio phraseology "
             "yourself, a separate rendering step handles that from your structured input."
         ),
         args_schema=FinalizeInstructionInput,
@@ -142,109 +142,158 @@ def _build_finalize_instruction_tool() -> StructuredTool:
     )
 
 
+class AdvanceToNextRoleInput(BaseModel):
+    target_role: str = Field(description=f"One of {list(ROLE_NAMES)} — the role to hand this aircraft to next")
+    aircraft_id: str = Field(description="ICAO24 hex address of the aircraft being handed off")
+    reason: str = Field(description="Brief note on why the handoff is happening now")
+
+
+def _build_advance_to_next_role_tool() -> StructuredTool:
+    async def _noop(**kwargs) -> str:
+        return "handled by reasoning node"
+
+    return StructuredTool.from_function(
+        name=ADVANCE_TO_NEXT_ROLE_TOOL_NAME,
+        description=(
+            "Hand an aircraft off to the next controller role. Does not require a response — "
+            "it records the handoff for audit purposes. Departures typically flow "
+            "CLEARANCE -> GROUND -> TOWER -> APPROACH; arrivals flow APPROACH -> TOWER -> GROUND."
+        ),
+        args_schema=AdvanceToNextRoleInput,
+        coroutine=_noop,
+    )
+
+
+class CheckRunwayConflictInput(BaseModel):
+    aircraft_id: str = Field(description="ICAO24 hex address of the aircraft awaiting the runway")
+    runway_id: str = Field(description="The runway this aircraft is holding short of or landing/departing on, e.g. '15R'")
+
+
+def _build_check_runway_conflict_tool() -> StructuredTool:
+    async def _noop(**kwargs) -> str:
+        return "handled by reasoning node"
+
+    return StructuredTool.from_function(
+        name=CHECK_RUNWAY_CONFLICT_TOOL_NAME,
+        description=(
+            "Deterministically check whether any commercial aircraft is within 2 NM of the "
+            "threshold of a runway that intersects the given runway_id. Call this before "
+            "clearing a 15/33 takeoff or landing — do not estimate the conflict distance "
+            "yourself."
+        ),
+        args_schema=CheckRunwayConflictInput,
+        coroutine=_noop,
+    )
+
+
 def make_reasoning_node(
-    agent_name: str,
+    role_name: str,
     llm: BaseChatModel,
     mcp_tools: list[StructuredTool],
-) -> Callable[[MultiAgentATCState], Coroutine[Any, Any, dict]]:
-    coordination_tool = _build_request_coordination_tool()
+) -> Callable[[MultiRoleATCState], Coroutine[Any, Any, dict]]:
     finalize_tool = _build_finalize_instruction_tool()
-    llm_with_tools = llm.bind_tools([*mcp_tools, coordination_tool, finalize_tool])
-    aircraft_key = "north_aircraft" if agent_name == "NORTH_TOWER" else "south_aircraft"
+    advance_tool = _build_advance_to_next_role_tool()
+    local_tools = [finalize_tool, advance_tool]
+    if role_name == "TOWER":
+        local_tools.append(_build_check_runway_conflict_tool())
+    llm_with_tools = llm.bind_tools([*mcp_tools, *local_tools])
 
-    async def reasoning_node(state: MultiAgentATCState) -> dict:
+    async def reasoning_node(state: MultiRoleATCState) -> dict:
         system = SystemMessage(
             content=_SYSTEM_PROMPT_TEMPLATE.format(
-                agent_name=agent_name,
-                tool_name=REQUEST_COORDINATION_TOOL_NAME,
-                finalize_tool_name=FINALIZE_INSTRUCTION_TOOL_NAME,
-                aircraft_json=json.dumps(state.get(aircraft_key, []), default=str),
+                facility_name=ROLE_FACILITY_NAME[role_name],
+                frequency=ROLE_FREQUENCY_MHZ[role_name],
+                rules=_RULES_BY_ROLE[role_name],
+                aircraft_json=json.dumps(state.get("aircraft_by_role", {}).get(role_name, []), default=str),
                 anomalies_json=json.dumps(state.get("active_anomalies", []), default=str),
-                coordination_json=json.dumps(state.get("inter_agent_buffer") or {}, default=str),
+                handoff_json=json.dumps(state.get("handoff_buffer") or {}, default=str),
             )
         )
         response: AIMessage = await llm_with_tools.ainvoke([system, *state["messages"]])
 
-        update: dict[str, Any] = {"messages": [response], "active_agent": agent_name}
+        update: dict[str, Any] = {"messages": [response], "active_role": role_name}
 
         all_calls = response.tool_calls or []
-        coordination_calls = [tc for tc in all_calls if tc["name"] == REQUEST_COORDINATION_TOOL_NAME]
+        conflict_calls = [tc for tc in all_calls if tc["name"] == CHECK_RUNWAY_CONFLICT_TOOL_NAME]
         finalize_calls = [tc for tc in all_calls if tc["name"] == FINALIZE_INSTRUCTION_TOOL_NAME]
+        advance_calls = [tc for tc in all_calls if tc["name"] == ADVANCE_TO_NEXT_ROLE_TOOL_NAME]
 
-        # Coordination takes priority: a cross-boundary action can't be finalized until it's
-        # been ACK'd, so if both were somehow called in the same turn, coordination wins and
-        # the finalize call (along with any plain MCP tool calls) is deferred to a later turn.
-        if coordination_calls:
-            call = coordination_calls[0]
-            args = call["args"]
-            update["inter_agent_buffer"] = {
-                "requires_coordination": True,
-                "origin_agent": agent_name,
-                "target_agent": args["target_agent"],
-                "aircraft_id": args["aircraft_id"],
-                "proposed_action": {
-                    "type": args["action_type"],
-                    "coordinate_threshold": args["coordinate_threshold"],
-                    "estimated_time_crossing": args["estimated_time_crossing"],
-                },
-                "reason": args["reason"],
-                "coordination_status": "PENDING",
-                "requested_at": datetime.now(timezone.utc).isoformat(),
+        # Same pattern as the 2-agent design: these three are always handled inline (they
+        # mutate graph state, not an external system), never routed to tool_executor. If the
+        # model also requested a real MCP tool in the same turn, it gets a deferred
+        # placeholder rather than actually executing — avoids the ordering complexity of a
+        # tool_executor round-trip happening in between an inline decision and its routing
+        # consequence (e.g. a stale final_instruction/handoff_buffer sitting in state across
+        # an extra LLM turn). The model can still call query_radar/query_faa_rules freely on
+        # a turn where it ISN'T also finalizing/advancing/checking a conflict.
+        #
+        # Priority when more than one appears in the same turn: a pending conflict check
+        # wins — Tower can't finalize a takeoff/landing decision until it has the
+        # deterministic verdict, so a finalize/advance call made in the same turn as
+        # check_runway_conflict is premature.
+        if conflict_calls:
+            call = conflict_calls[0]
+            update["handoff_buffer"] = {
+                "kind": "CONFLICT_CHECK",
+                "status": "PENDING",
+                "origin_role": role_name,
+                "aircraft_id": call["args"]["aircraft_id"],
+                "runway_id": call["args"]["runway_id"],
             }
-            # Acknowledge the tool call locally so the message history stays valid for the
-            # next LLM turn — this tool is handled here, never sent to tool_executor.
             tool_messages = [
-                ToolMessage(
-                    content=f"Coordination request recorded, awaiting ACK from {args['target_agent']}.",
-                    tool_call_id=call["id"],
-                )
+                ToolMessage(content="Runway conflict check requested, awaiting verdict.", tool_call_id=call["id"])
             ]
-            # Defensive: Anthropic allows parallel tool calls, so the model may have asked
-            # for query_radar/query_faa_rules (or finalize_instruction) in the SAME turn as
-            # request_coordination. Every tool_use block needs exactly one tool_result before
-            # the next API call, but this turn is being diverted to inter_agent_comm_handler
-            # instead of tool_executor/phraseology_generator — so answer any other pending
-            # calls with a deferred placeholder rather than leaving them unanswered (which
-            # would 400 the next call the same way the missing coordination result did).
             for tc in all_calls:
-                if tc["name"] != REQUEST_COORDINATION_TOOL_NAME:
+                if tc["id"] != call["id"]:
                     tool_messages.append(
-                        ToolMessage(
-                            content="Deferred — coordination request takes precedence this turn.",
-                            tool_call_id=tc["id"],
-                        )
+                        ToolMessage(content="Deferred — conflict check takes precedence this turn.", tool_call_id=tc["id"])
                     )
             update["messages"] = [response, *tool_messages]
+            return update
 
-        elif finalize_calls:
+        if not finalize_calls and not advance_calls:
+            # Neither local tool was called — either plain text (no action needed) or pure
+            # MCP tool calls to gather info. Let those reach tool_executor normally.
+            return update
+
+        tool_messages = []
+        if finalize_calls:
             call = finalize_calls[0]
             args = call["args"]
             update["final_instruction"] = {
-                "agent_name": agent_name,
+                "role_name": role_name,
                 "aircraft_id": args["aircraft_id"],
                 "callsign": args["callsign"],
                 "components": args["components"],
                 "read_back_required": args.get("read_back_required", True),
             }
-            tool_messages = [
-                ToolMessage(
-                    content="Instruction finalized, phraseology being generated.",
-                    tool_call_id=call["id"],
-                )
-            ]
-            # Same defensive reasoning as above — a parallel MCP tool call alongside
-            # finalize_instruction needs an answer too, since this turn routes straight to
-            # phraseology_generator rather than tool_executor.
-            for tc in all_calls:
-                if tc["name"] != FINALIZE_INSTRUCTION_TOOL_NAME:
-                    tool_messages.append(
-                        ToolMessage(
-                            content="Deferred — instruction finalization takes precedence this turn.",
-                            tool_call_id=tc["id"],
-                        )
-                    )
-            update["messages"] = [response, *tool_messages]
+            tool_messages.append(
+                ToolMessage(content="Instruction finalized, phraseology being generated.", tool_call_id=call["id"])
+            )
 
+        if advance_calls:
+            call = advance_calls[0]
+            args = call["args"]
+            update["handoff_buffer"] = {
+                "kind": "HANDOFF",
+                "status": "PENDING",
+                "origin_role": role_name,
+                "target_role": args["target_role"],
+                "aircraft_id": args["aircraft_id"],
+                "reason": args["reason"],
+            }
+            tool_messages.append(
+                ToolMessage(content=f"Handoff to {args['target_role']} recorded.", tool_call_id=call["id"])
+            )
+
+        handled_ids = {tc["id"] for tc in finalize_calls[:1] + advance_calls[:1]}
+        for tc in all_calls:
+            if tc["id"] not in handled_ids:
+                tool_messages.append(
+                    ToolMessage(content="Deferred — finalized this turn takes precedence.", tool_call_id=tc["id"])
+                )
+
+        update["messages"] = [response, *tool_messages]
         return update
 
     return reasoning_node

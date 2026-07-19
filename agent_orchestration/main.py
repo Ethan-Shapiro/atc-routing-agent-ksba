@@ -1,8 +1,18 @@
-"""FastAPI entrypoint. The graph is triggered two ways:
+"""FastAPI entrypoint. The graph is triggered three ways:
 
 1. Automatically, via a background task LISTENing on Postgres' `new_anomaly` channel
-   (data_pipeline/sql/005_notify_anomaly.sql) — the primary trigger path in production.
-2. Manually, via POST /trigger/{anomaly_id} — for testing without waiting on a real anomaly.
+   (data_pipeline/sql/005_notify_anomaly.sql) — Tower's runway-intersection conflict rule
+   IS an anomaly type (PROXIMITY_CONFLICT), so this path stays live for the KSBA rescope.
+2. Manually, via POST /trigger/{anomaly_id} — for testing the anomaly path without waiting
+   on a real one.
+3. Manually, via POST /trigger/{role}/{icao24} — invokes one of the 4 roles directly on a
+   specific aircraft. This is currently the ONLY way to reach CLEARANCE: an aircraft awaiting
+   an IFR clearance at the gate typically isn't broadcasting ADS-B yet, so it can't be found
+   in aircraft_state_current the way a taxiing/airborne aircraft can, and observation_builder
+   never buckets anything into CLEARANCE (see state.py's note). This is a structural
+   limitation of live radar data, not a v1 shortcut — a later stage may add live
+   phase-of-flight NOTIFY triggering for GROUND/TOWER/APPROACH, but CLEARANCE stays
+   manual/synthetic regardless.
 """
 
 import asyncio
@@ -14,10 +24,12 @@ import asyncpg
 from fastapi import FastAPI, HTTPException
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage
+from pydantic import BaseModel
 
 from config import settings
 from graph import build_graph
 from mcp_client import MCPToolClient, build_langchain_tools
+from roles import ROLE_NAMES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("agent-orchestration")
@@ -27,19 +39,33 @@ app = FastAPI(title="ATC Agent Orchestration")
 _state: dict = {}
 
 
-async def _run_graph_for_anomaly(anomaly_id: int) -> dict:
+async def _run_graph(initial_state: dict) -> dict:
     graph = _state["graph"]
-    initial_state = {
-        "messages": [HumanMessage(content=f"New anomaly detected: anomaly_events.id={anomaly_id}")],
-        "active_agent": "COORDINATOR",
-        "north_aircraft": [],
-        "south_aircraft": [],
-        "inter_agent_buffer": {},
+    # Hard safety net, not just a workaround: a reasoning loop that never terminates (model
+    # keeps re-requesting a conflict check, keeps calling tools, etc.) should fail fast and
+    # loud rather than run indefinitely — this is exactly the kind of runaway-cost/runaway-
+    # action failure mode a deterministic cap protects against, consistent with the project's
+    # own "deterministic safety guardrails" guardrail.
+    return await graph.ainvoke(initial_state, config={"recursion_limit": 12})
+
+
+def _base_initial_state() -> dict:
+    return {
+        "messages": [],
+        "active_role": "IDLE",
+        "aircraft_by_role": {},
+        "handoff_buffer": {},
         "final_instruction": None,
-        # observation_builder overwrites this with the live open-anomaly list, but the
-        # entry router needs a hint about *which* anomaly triggered this run, so seed it.
-        "active_anomalies": [{"id": anomaly_id, "aircraft_icao24_1": None}],
+        "active_anomalies": [],
     }
+
+
+async def _run_graph_for_anomaly(anomaly_id: int) -> dict:
+    initial_state = _base_initial_state()
+    initial_state["messages"] = [HumanMessage(content=f"New anomaly detected: anomaly_events.id={anomaly_id}")]
+    # observation_builder overwrites this with the live open-anomaly list, but the entry
+    # router needs a hint about *which* anomaly triggered this run, so seed it.
+    initial_state["active_anomalies"] = [{"id": anomaly_id, "aircraft_icao24_1": None}]
 
     async with _state["pool"].acquire() as conn:
         row = await conn.fetchrow(
@@ -49,13 +75,19 @@ async def _run_graph_for_anomaly(anomaly_id: int) -> dict:
         raise HTTPException(404, f"anomaly_events.id={anomaly_id} not found")
     initial_state["active_anomalies"][0]["aircraft_icao24_1"] = row["aircraft_icao24_1"]
 
-    # Hard safety net, not just a workaround: a reasoning loop that never terminates (model
-    # keeps re-requesting coordination, keeps calling tools, etc.) should fail fast and loud
-    # rather than run indefinitely — this is exactly the kind of runaway-cost/runaway-action
-    # failure mode a deterministic cap protects against, consistent with the project's own
-    # "deterministic safety guardrails" guardrail.
-    final_state = await graph.ainvoke(initial_state, config={"recursion_limit": 12})
-    return final_state
+    return await _run_graph(initial_state)
+
+
+async def _run_graph_for_role(role: str, icao24: str, context: str | None) -> dict:
+    initial_state = _base_initial_state()
+    initial_state["active_role"] = role  # bypasses the anomaly-based entry router entirely
+    seed_text = context or (
+        f"{icao24} checking in with {role.title()}."
+        if role != "CLEARANCE"
+        else f"{icao24} requesting IFR clearance."
+    )
+    initial_state["messages"] = [HumanMessage(content=seed_text)]
+    return await _run_graph(initial_state)
 
 
 async def _listen_for_anomalies() -> None:
@@ -99,13 +131,14 @@ async def startup() -> None:
     # thinking + the tool-heavy system prompt + the actual response all share one budget.
     # A tight budget risks the model's real decision (text or a finalize_instruction call)
     # being silently truncated to nothing after thinking consumes most of it — observed live
-    # during Phase 4 integration testing: a turn ended with an empty thinking block and no
-    # text or tool call, on an anomaly with an unambiguous, active 0.28 NM conflict.
+    # during Phase 4 integration testing on the old 2-agent design.
     llm = ChatAnthropic(model=settings.llm_model, api_key=settings.anthropic_api_key, max_tokens=16000)
 
-    _state["graph"] = build_graph(llm, mcp_tools, _state["pool"])
+    _state["graph"] = build_graph(
+        llm, mcp_tools, _state["pool"], airport_lat=settings.airport_lat, airport_lon=settings.airport_lon
+    )
     _state["listener_task"] = asyncio.create_task(_listen_for_anomalies())
-    log.info("agent_orchestration ready")
+    log.info("agent_orchestration ready (KSBA, 4-role)")
 
 
 @app.on_event("shutdown")
@@ -122,13 +155,37 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/trigger/{anomaly_id}")
-async def trigger(anomaly_id: int) -> dict:
-    """Manually run the graph for an existing anomaly_events row — for testing."""
-    final_state = await _run_graph_for_anomaly(anomaly_id)
+def _final_response(final_state: dict) -> dict:
     return {
-        "active_agent": final_state["active_agent"],
-        "inter_agent_buffer": final_state["inter_agent_buffer"],
+        "active_role": final_state["active_role"],
+        "handoff_buffer": final_state["handoff_buffer"],
         "message_count": len(final_state["messages"]),
         "final_message": str(final_state["messages"][-1].content) if final_state["messages"] else None,
     }
+
+
+@app.post("/trigger/{anomaly_id}")
+async def trigger_anomaly(anomaly_id: int) -> dict:
+    """Manually run the graph for an existing anomaly_events row — for testing."""
+    return _final_response(await _run_graph_for_anomaly(anomaly_id))
+
+
+class TriggerRoleRequest(BaseModel):
+    # Freeform context for the seed message — required in practice for CLEARANCE (the
+    # aircraft has no radar state to fall back on) and useful for the other 3 roles when
+    # testing a scenario query_radar alone wouldn't capture (e.g. a specific traffic
+    # conflict). Optional: a generic check-in message is used if omitted.
+    context: str | None = None
+
+
+@app.post("/trigger/{role}/{icao24}")
+async def trigger_role(role: str, icao24: str, body: TriggerRoleRequest | None = None) -> dict:
+    """Manually invoke one role's reasoning on a specific aircraft — the only way to reach
+    CLEARANCE (see module docstring), and the mechanism used to verify the full
+    Clearance -> Ground -> Tower -> Approach chain end-to-end before live auto-triggering
+    exists for GROUND/TOWER/APPROACH."""
+    role_upper = role.upper()
+    if role_upper not in ROLE_NAMES:
+        raise HTTPException(400, f"role must be one of {list(ROLE_NAMES)}, got {role!r}")
+    context = body.context if body else None
+    return _final_response(await _run_graph_for_role(role_upper, icao24, context))

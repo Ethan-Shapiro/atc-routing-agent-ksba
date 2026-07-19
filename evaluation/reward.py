@@ -185,6 +185,12 @@ async def compute_coordination_reward(conn: asyncpg.Connection, start: datetime,
     computed — Phase 3 logs coordination outcomes, not individual ATC instructions, so there
     is no way to detect *why* an aircraft stopped moving, only that it did (already captured
     by compute_throughput_reward's delay term).
+
+    KNOWN BREAK (post-KSBA-rescope, deferred to Stage 3): this still queries the retired
+    runway_complex table, which no longer exists — agent_orchestration moved to a per-runway
+    `runway` table and a 4-role (Clearance/Ground/Tower/Approach) sequential handoff model
+    with no "complex membership" concept to cross. This function will raise until it's
+    reworked to detect role-handoff transitions instead of complex crossings.
     """
     rows = await conn.fetch(
         """

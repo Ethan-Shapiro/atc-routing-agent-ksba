@@ -18,10 +18,10 @@ class Settings(BaseSettings):
     postgis_host: str = "postgis"
     postgis_port: int = 5432
 
-    # Domain constants
-    lax_lat: float = 33.9425
-    lax_lon: float = -118.4081
-    coverage_radius_miles: float = 50.0
+    # Domain constants (Santa Barbara Municipal — KSBA)
+    airport_lat: float = 34.4262
+    airport_lon: float = -119.8415
+    coverage_radius_miles: float = 25.0
     poll_interval_seconds: float = 12.0
 
     @property

@@ -17,6 +17,13 @@ class Settings(BaseSettings):
     anthropic_api_key: str = ""
     llm_model: str = "claude-sonnet-5"
 
+    # KSBA reference point — used by observation_builder's phase-of-flight classifier to
+    # compute each aircraft's distance from the airport. Matches data_pipeline/poller's
+    # bbox center (kept as a separate setting here rather than shared config, consistent
+    # with how postgis_* creds are duplicated per-service rather than centralized).
+    airport_lat: float = 34.4262
+    airport_lon: float = -119.8415
+
     @property
     def postgres_dsn(self) -> str:
         return (

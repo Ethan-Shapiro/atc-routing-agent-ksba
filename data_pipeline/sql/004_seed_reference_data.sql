@@ -1,8 +1,10 @@
 -- Reference data. Both tables are designed to be extended in place (no code redeploy needed).
 
--- Commercial-carrier ICAO callsign prefixes serving LAX. Non-exhaustive starter set covering
--- major US majors/low-cost carriers, common TBIT international carriers, and major cargo
--- operators — add rows here as unmatched commercial callsigns are observed in ingestion_audit_log.
+-- Commercial-carrier ICAO callsign prefixes. KSBA's actual scheduled service is a small
+-- subset of this list (SkyWest/United Express, American Eagle, Alaska) — the rest is kept as
+-- a general-purpose reference set (majors, low-cost carriers, cargo) so occasional diverted/
+-- charter/repositioning traffic through the bbox still matches without a redeploy. Add rows
+-- here as unmatched commercial callsigns are observed in ingestion_audit_log.
 INSERT INTO airline_designators (icao_prefix, airline_name) VALUES
     ('AAL', 'American Airlines'),
     ('DAL', 'Delta Air Lines'),
@@ -37,16 +39,35 @@ INSERT INTO airline_designators (icao_prefix, airline_name) VALUES
     ('GTI', 'Atlas Air')
 ON CONFLICT (icao_prefix) DO NOTHING;
 
--- Coarse North/South tower jurisdiction boundaries, split at the approximate Taxiline Tango
--- dividing latitude (33.944) referenced in multi-agent_orchestration_rf_layer.md. These are
--- rectangular placeholders covering the LAX complex and immediate approach/departure corridors,
--- NOT precise runway-centerline-derived polygons — refine with real airport diagram data when
--- Phase 3 (ST_Contains-based north_aircraft/south_aircraft population) is implemented.
-INSERT INTO runway_complex (complex_name, boundary) VALUES
-    ('NORTH', ST_SetSRID(ST_GeomFromText(
-        'POLYGON((-118.470 33.944, -118.370 33.944, -118.370 33.985, -118.470 33.985, -118.470 33.944))'
-    ), 4326)::geography),
-    ('SOUTH', ST_SetSRID(ST_GeomFromText(
-        'POLYGON((-118.470 33.900, -118.370 33.900, -118.370 33.944, -118.470 33.944, -118.470 33.900))'
-    ), 4326)::geography)
-ON CONFLICT (complex_name) DO NOTHING;
+-- KSBA runway geometry: primary Runway 7/25 (~6,050 ft) crossed by the shorter 15/33 pair
+-- (15L/33R ~4,180 ft, 15R/33L ~2,890 ft). Coordinates below are approximate — derived from
+-- the airport reference point (34.4262, -119.8415) plus published headings/lengths, NOT
+-- surveyed from an official airport diagram. Same "close enough for a portfolio project"
+-- precision bar the old LAX placeholder rectangles used; refine if real diagram data
+-- becomes available.
+INSERT INTO runway (runway_id, heading_deg, threshold_geom, centerline_geom, intersects_with) VALUES
+    ('7', 70,
+        ST_SetSRID(ST_MakePoint(-119.8510, 34.4234), 4326)::geography,
+        ST_SetSRID(ST_MakeLine(ST_MakePoint(-119.8510, 34.4234), ST_MakePoint(-119.8321, 34.4290)), 4326)::geography,
+        '{15L,33R,15R,33L}'),
+    ('25', 250,
+        ST_SetSRID(ST_MakePoint(-119.8321, 34.4290), 4326)::geography,
+        ST_SetSRID(ST_MakeLine(ST_MakePoint(-119.8510, 34.4234), ST_MakePoint(-119.8321, 34.4290)), 4326)::geography,
+        '{15L,33R,15R,33L}'),
+    ('15L', 150,
+        ST_SetSRID(ST_MakePoint(-119.8450, 34.4312), 4326)::geography,
+        ST_SetSRID(ST_MakeLine(ST_MakePoint(-119.8450, 34.4312), ST_MakePoint(-119.8380, 34.4212)), 4326)::geography,
+        '{7,25}'),
+    ('33R', 330,
+        ST_SetSRID(ST_MakePoint(-119.8380, 34.4212), 4326)::geography,
+        ST_SetSRID(ST_MakeLine(ST_MakePoint(-119.8450, 34.4312), ST_MakePoint(-119.8380, 34.4212)), 4326)::geography,
+        '{7,25}'),
+    ('15R', 150,
+        ST_SetSRID(ST_MakePoint(-119.8396, 34.4305), 4326)::geography,
+        ST_SetSRID(ST_MakeLine(ST_MakePoint(-119.8396, 34.4305), ST_MakePoint(-119.8353, 34.4230)), 4326)::geography,
+        '{7,25}'),
+    ('33L', 330,
+        ST_SetSRID(ST_MakePoint(-119.8353, 34.4230), 4326)::geography,
+        ST_SetSRID(ST_MakeLine(ST_MakePoint(-119.8396, 34.4305), ST_MakePoint(-119.8353, 34.4230)), 4326)::geography,
+        '{7,25}')
+ON CONFLICT (runway_id) DO NOTHING;

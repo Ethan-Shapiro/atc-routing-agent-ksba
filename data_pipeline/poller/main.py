@@ -131,7 +131,7 @@ async def run() -> None:
     client = OpenSkyClient(settings.opensky_client_id, settings.opensky_client_secret)
     budget = CreditBudget(settings.opensky_daily_credit_budget)
     breaker = CircuitBreaker()
-    bbox = compute_bbox(settings.lax_lat, settings.lax_lon, settings.coverage_radius_miles)
+    bbox = compute_bbox(settings.airport_lat, settings.airport_lon, settings.coverage_radius_miles)
     airline_prefixes = await db.load_airline_prefixes(pool)
 
     log.info("Starting OpenSky poller: bbox=%s interval=%.1fs", bbox, settings.poll_interval_seconds)

@@ -12,4 +12,5 @@ CREATE INDEX idx_anomaly_events_detected_at ON anomaly_events (detected_at);
 CREATE INDEX idx_anomaly_events_open_pairs ON anomaly_events (aircraft_icao24_1, aircraft_icao24_2)
     WHERE resolved_at IS NULL;
 
-CREATE INDEX idx_runway_complex_boundary ON runway_complex USING GIST (boundary);
+CREATE INDEX idx_runway_threshold_geom ON runway USING GIST (threshold_geom);
+CREATE INDEX idx_runway_centerline_geom ON runway USING GIST (centerline_geom);

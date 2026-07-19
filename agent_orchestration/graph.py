@@ -1,14 +1,13 @@
-"""LangGraph wiring: routing logic and edges, per multi-agent_orchestration_rf_layer.md.
+"""LangGraph wiring: routing logic and edges for the KSBA 4-role sequential handoff design.
 
-Design note on the START fan-out: the spec's ASCII diagram shows arrows from START into
-both North and South Reasoning converging on one Conditional Router. Taken literally
-(both branches firing every turn) that's inconsistent with the router's own logic, which
-reads a single `state["active_agent"]` and `state["messages"][-1]` — values that only make
-sense for one agent's turn. This graph instead treats `active_agent` as "who currently holds
-execution focus" (its own field description) — a turn-based single-active-agent loop, not a
-parallel fan-out — since that's the interpretation the router code actually supports. An
-entry router (using observation_builder's north/south classification) picks the one agent
-whose jurisdiction the triggering anomaly falls in.
+Replaces the LAX-era 2-agent (NORTH_TOWER/SOUTH_TOWER) graph. Each of the 4 roles
+(CLEARANCE/GROUND/TOWER/APPROACH) gets its own reasoning node from the same
+make_reasoning_node factory used for both of the old design's agents. Unlike that design,
+there's no single fixed "next" role: a plain handoff (advance_to_next_role) targets an
+EXPLICIT role picked by the LLM and does not re-enter another reasoning node within this
+graph run at all — see nodes/handoff_handler.py's docstring for why. The only round-trip
+within a single run is Tower's deterministic runway-conflict check, which returns to the
+SAME role node that requested it.
 """
 
 import asyncpg
@@ -17,7 +16,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import ToolNode
 
-from nodes.inter_agent_comm_handler import make_inter_agent_comm_handler
+from nodes.handoff_handler import make_handoff_handler
 from nodes.observation_builder import make_observation_builder
 from nodes.phraseology_generator import (
     PhraseologyBackend,
@@ -25,88 +24,108 @@ from nodes.phraseology_generator import (
     make_phraseology_generator,
 )
 from nodes.reasoning_engine import (
+    ADVANCE_TO_NEXT_ROLE_TOOL_NAME,
+    CHECK_RUNWAY_CONFLICT_TOOL_NAME,
     FINALIZE_INSTRUCTION_TOOL_NAME,
-    REQUEST_COORDINATION_TOOL_NAME,
     make_reasoning_node,
 )
-from state import MultiAgentATCState
+from roles import ROLE_NAMES
+from state import MultiRoleATCState
 
 # Tool names the reasoning node intercepts inline (see reasoning_engine.py) rather than
 # routing to tool_executor — anything else in a response's tool_calls is a real MCP call.
-_INLINE_HANDLED_TOOL_NAMES = {REQUEST_COORDINATION_TOOL_NAME, FINALIZE_INSTRUCTION_TOOL_NAME}
+_INLINE_HANDLED_TOOL_NAMES = {
+    ADVANCE_TO_NEXT_ROLE_TOOL_NAME,
+    FINALIZE_INSTRUCTION_TOOL_NAME,
+    CHECK_RUNWAY_CONFLICT_TOOL_NAME,
+}
+
+_NODE_NAME_BY_ROLE = {role: f"{role.lower()}_reasoning" for role in ROLE_NAMES}
 
 
-def _entry_router(state: MultiAgentATCState) -> str:
-    """Picks which agent's turn it is based on the triggering anomaly's aircraft."""
+def _entry_router(state: MultiRoleATCState) -> str:
+    """Two ways into the graph: an explicit requested role (main.py's manual
+    /trigger/{role}/{icao24} endpoint sets active_role before this runs), or — for the
+    anomaly-driven LISTEN/NOTIFY path — whichever role's aircraft list contains the
+    triggering anomaly's aircraft."""
+    requested_role = state.get("active_role")
+    if requested_role in _NODE_NAME_BY_ROLE:
+        return _NODE_NAME_BY_ROLE[requested_role]
+
     anomalies = state.get("active_anomalies") or []
     if not anomalies:
         return END
 
     target_icao24 = anomalies[0]["aircraft_icao24_1"]
-    north_ids = {a["icao24"] for a in state.get("north_aircraft", [])}
-    south_ids = {a["icao24"] for a in state.get("south_aircraft", [])}
-
-    if target_icao24 in north_ids:
-        return "north_reasoning"
-    if target_icao24 in south_ids:
-        return "south_reasoning"
-    # Aircraft isn't in either complex's current observation (e.g. it already left) —
-    # nothing actionable this turn.
+    aircraft_by_role = state.get("aircraft_by_role") or {}
+    for role, node_name in _NODE_NAME_BY_ROLE.items():
+        ids = {a["icao24"] for a in aircraft_by_role.get(role, [])}
+        if target_icao24 in ids:
+            return node_name
+    # Aircraft isn't in any role's current observation (e.g. it already left) — nothing
+    # actionable this turn.
     return END
 
 
-def _multi_agent_router(state: MultiAgentATCState) -> str:
-    """Verbatim logic from multi-agent_orchestration_rf_layer.md's multi_agent_router,
-    adapted for LangGraph's conditional-edge return-a-node-name convention."""
+def _reasoning_router(state: MultiRoleATCState) -> str:
     last_message = state["messages"][-1]
 
     tool_calls = getattr(last_message, "tool_calls", None) or []
-    # request_coordination and finalize_instruction are both handled inline by the reasoning
-    # node, never routed to tool_executor — only real MCP calls (query_radar/query_faa_rules)
-    # reach it here.
+    # advance_to_next_role, finalize_instruction, and check_runway_conflict are all handled
+    # inline by the reasoning node, never routed to tool_executor — only real MCP calls
+    # (query_radar/query_faa_rules) reach it here.
     mcp_tool_calls = [tc for tc in tool_calls if tc["name"] not in _INLINE_HANDLED_TOOL_NAMES]
     if mcp_tool_calls:
         return "tool_executor"
 
-    # A finalized instruction takes priority over END: the reasoning node has decided on a
-    # concrete action and needs it rendered into phraseology before this turn is done.
+    # A pending handoff_buffer entry (either kind) needs to be resolved before this turn is
+    # done — checked before final_instruction because a CONFLICT_CHECK is a prerequisite for
+    # ever reaching a finalized decision (reasoning_engine.py defers finalize/advance calls
+    # made in the same turn as a conflict check, so the two states can't both be pending at
+    # once for the same role).
+    buffer = state.get("handoff_buffer") or {}
+    if buffer.get("status") == "PENDING":
+        return "handoff_handler"
+
     if state.get("final_instruction"):
         return "phraseology_generator"
-
-    # requires_coordination is the sole guard, and it's reliable: inter_agent_comm_handler
-    # clears it to False on resolution. (An earlier version additionally checked
-    # `active_agent != "COORDINATOR"` — but reasoning_node unconditionally overwrites
-    # active_agent to its own name on every call, silently clobbering that guard before the
-    # router ever saw it, which caused an infinite reasoning <-> comm_handler loop.)
-    buffer = state.get("inter_agent_buffer") or {}
-    if buffer.get("requires_coordination"):
-        return "inter_agent_comm_handler"
 
     return END
 
 
-def _route_back_to_active_agent(state: MultiAgentATCState) -> str:
-    return "north_reasoning" if state["active_agent"] == "NORTH_TOWER" else "south_reasoning"
+def _route_back_to_active_role(state: MultiRoleATCState) -> str:
+    return _NODE_NAME_BY_ROLE[state["active_role"]]
 
 
-def _route_back_to_origin_agent(state: MultiAgentATCState) -> str:
-    origin = state["inter_agent_buffer"]["origin_agent"]
-    return "north_reasoning" if origin == "NORTH_TOWER" else "south_reasoning"
+def _route_after_handoff(state: MultiRoleATCState) -> str:
+    buffer = state["handoff_buffer"]
+    if buffer["kind"] == "CONFLICT_CHECK":
+        # Return to the same role so it can act on the ACK/COUNTER_PROPOSAL verdict.
+        return _NODE_NAME_BY_ROLE[state["active_role"]]
+    # kind == "HANDOFF": does not re-enter the target role's node (see module docstring) —
+    # only continues to phraseology_generator if this turn ALSO finalized an instruction.
+    if state.get("final_instruction"):
+        return "phraseology_generator"
+    return END
 
 
 def build_graph(
     llm: BaseChatModel,
     mcp_tools: list[StructuredTool],
     pool: asyncpg.Pool,
+    airport_lat: float,
+    airport_lon: float,
     phraseology_backend: PhraseologyBackend | None = None,
 ):
-    graph = StateGraph(MultiAgentATCState)
+    graph = StateGraph(MultiRoleATCState)
 
-    graph.add_node("observation_builder", make_observation_builder(pool))
-    graph.add_node("north_reasoning", make_reasoning_node("NORTH_TOWER", llm, mcp_tools))
-    graph.add_node("south_reasoning", make_reasoning_node("SOUTH_TOWER", llm, mcp_tools))
+    graph.add_node(
+        "observation_builder", make_observation_builder(pool, airport_lat=airport_lat, airport_lon=airport_lon)
+    )
+    for role in ROLE_NAMES:
+        graph.add_node(_NODE_NAME_BY_ROLE[role], make_reasoning_node(role, llm, mcp_tools))
     graph.add_node("tool_executor", ToolNode(mcp_tools))
-    graph.add_node("inter_agent_comm_handler", make_inter_agent_comm_handler(pool))
+    graph.add_node("handoff_handler", make_handoff_handler(pool))
     graph.add_node(
         "phraseology_generator",
         make_phraseology_generator(phraseology_backend or TemplatePhraseologyBackend()),
@@ -116,30 +135,30 @@ def build_graph(
     graph.add_conditional_edges(
         "observation_builder",
         _entry_router,
-        {"north_reasoning": "north_reasoning", "south_reasoning": "south_reasoning", END: END},
+        {**{node: node for node in _NODE_NAME_BY_ROLE.values()}, END: END},
     )
 
-    for node in ("north_reasoning", "south_reasoning"):
+    for node in _NODE_NAME_BY_ROLE.values():
         graph.add_conditional_edges(
             node,
-            _multi_agent_router,
+            _reasoning_router,
             {
                 "tool_executor": "tool_executor",
+                "handoff_handler": "handoff_handler",
                 "phraseology_generator": "phraseology_generator",
-                "inter_agent_comm_handler": "inter_agent_comm_handler",
                 END: END,
             },
         )
 
     graph.add_conditional_edges(
         "tool_executor",
-        _route_back_to_active_agent,
-        {"north_reasoning": "north_reasoning", "south_reasoning": "south_reasoning"},
+        _route_back_to_active_role,
+        {node: node for node in _NODE_NAME_BY_ROLE.values()},
     )
     graph.add_conditional_edges(
-        "inter_agent_comm_handler",
-        _route_back_to_origin_agent,
-        {"north_reasoning": "north_reasoning", "south_reasoning": "south_reasoning"},
+        "handoff_handler",
+        _route_after_handoff,
+        {**{node: node for node in _NODE_NAME_BY_ROLE.values()}, "phraseology_generator": "phraseology_generator", END: END},
     )
     # Terminal: phraseology has been generated, the turn is done.
     graph.add_edge("phraseology_generator", END)

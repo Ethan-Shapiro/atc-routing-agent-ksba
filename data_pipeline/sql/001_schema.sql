@@ -1,4 +1,4 @@
--- Autonomous ATC Routing Agent (LAX Tower) — Phase 1 domain schema
+-- Autonomous ATC Routing Agent (Santa Barbara Municipal — KSBA) — Phase 1 domain schema
 -- Applied automatically on first PostGIS container init (mounted into /docker-entrypoint-initdb.d)
 
 CREATE EXTENSION IF NOT EXISTS postgis;
@@ -99,9 +99,16 @@ CREATE TABLE airline_designators (
     airline_name    text NOT NULL
 );
 
--- North/South tower jurisdiction polygons. Added in Phase 1 so Phase 3's LangGraph agents
--- can populate north_aircraft/south_aircraft via ST_Contains without a schema migration.
-CREATE TABLE runway_complex (
-    complex_name    text PRIMARY KEY,  -- 'NORTH' | 'SOUTH'
-    boundary        geography(Polygon, 4326) NOT NULL
+-- Per-runway geometry for KSBA. Replaces the old LAX-era coarse North/South jurisdiction
+-- rectangles: KSBA has a single physical runway intersection (7/25 crossed by the 15/33
+-- pair) that the Tower agent's separation rule depends on directly, so precise per-runway
+-- threshold/centerline data is both meaningful and tractable at this airport's scale.
+CREATE TABLE runway (
+    runway_id       text PRIMARY KEY,        -- '7' | '25' | '15L' | '33R' | '15R' | '33L'
+    heading_deg     numeric NOT NULL,
+    threshold_geom  geography(Point, 4326) NOT NULL,
+    centerline_geom geography(LineString, 4326) NOT NULL,
+    -- Other runway_ids that physically cross this one (e.g. '25' lists the 15/33 pair).
+    -- Drives Tower's intersection safety check — see nodes/inter_agent_comm_handler.py.
+    intersects_with text[] NOT NULL DEFAULT '{}'
 );
