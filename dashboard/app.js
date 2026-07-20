@@ -152,7 +152,7 @@ async function runStep(step) {
   const res = await fetch(`/trigger/${step.role.toLowerCase()}/${step.icao24}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ context: step.context }),
+    body: JSON.stringify({ context: step.context, position: step.position || null }),
   });
   if (!res.ok) {
     const text = await res.text();

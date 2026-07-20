@@ -88,6 +88,13 @@ async def _run_graph_for_role(role: str, icao24: str, context: str | None) -> di
         if role != "CLEARANCE"
         else f"{icao24} requesting IFR clearance."
     )
+    # The seed text is free-text radio phraseology (a callsign, not an ICAO24), so without
+    # this the model has no legitimate way to know which aircraft_state_current row a given
+    # callsign maps to — observed live: it either grabbed an unrelated aircraft that happened
+    # to be in its jurisdiction list, or fabricated a plausible-looking hex code outright.
+    # icao24 is the one piece of ground truth this endpoint already has (from the URL), so
+    # hand it over explicitly rather than making the model guess.
+    seed_text = f"[Aircraft ICAO24: {icao24}] {seed_text}"
     initial_state["messages"] = [HumanMessage(content=seed_text)]
     return await _run_graph(initial_state)
 
@@ -157,6 +164,21 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+def _message_text(content) -> str | None:
+    """AIMessage.content is a plain string only when the model skipped extended thinking.
+    Claude Sonnet 5 runs adaptive thinking by default, so a turn that doesn't call
+    finalize_instruction (and therefore never reaches phraseology_generator's own clean
+    AIMessage) ends with the reasoning node's raw response instead — content is then a list
+    of {"type": "thinking"/"text", ...} blocks, and str()-ing that list directly produces an
+    unreadable Python repr of the whole structure, thinking block included."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = [b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in text_parts if p) or None
+    return str(content)
+
+
 def _tool_calls_trace(final_state: dict) -> list[dict]:
     """Every tool call made across this run, in order — lets the dashboard show that a
     decision was grounded in a real query_radar/query_faa_rules call (or a deterministic
@@ -182,7 +204,7 @@ async def _final_response(final_state: dict, icao24: str | None = None) -> dict:
         "active_role": final_state["active_role"],
         "handoff_buffer": final_state["handoff_buffer"],
         "message_count": len(final_state["messages"]),
-        "final_message": str(final_state["messages"][-1].content) if final_state["messages"] else None,
+        "final_message": _message_text(final_state["messages"][-1].content) if final_state["messages"] else None,
         "tool_calls": _tool_calls_trace(final_state),
         # None for CLEARANCE (the aircraft has no radar position yet — see module docstring).
         "aircraft_position": await _aircraft_position(icao24) if icao24 else None,
@@ -195,12 +217,34 @@ async def trigger_anomaly(anomaly_id: int) -> dict:
     return await _final_response(await _run_graph_for_anomaly(anomaly_id))
 
 
+class PositionUpdate(BaseModel):
+    longitude: float
+    latitude: float
+    baro_altitude_m: float
+    on_ground: bool
+    velocity_mps: float
+
+
 class TriggerRoleRequest(BaseModel):
     # Freeform context for the seed message — required in practice for CLEARANCE (the
     # aircraft has no radar state to fall back on) and useful for the other 3 roles when
     # testing a scenario query_radar alone wouldn't capture (e.g. a specific traffic
     # conflict). Optional: a generic check-in message is used if omitted.
     context: str | None = None
+    # Optional: move the aircraft to match this step's point in a scenario's narrative
+    # before running the graph. Without this, a multi-step scenario's aircraft stays frozen
+    # at wherever it was originally seeded — observed live: a "clear of the runway, taxiing
+    # in" step still showed the aircraft airborne 9 NM out, and the model (correctly)
+    # refused to issue taxi instructions rather than act on the stale position.
+    position: PositionUpdate | None = None
+
+
+_UPDATE_AIRCRAFT_POSITION_SQL = """
+UPDATE aircraft_state_current
+SET longitude = $1, latitude = $2, baro_altitude_m = $3, on_ground = $4, velocity_mps = $5,
+    last_contact = now()
+WHERE icao24 = $6
+"""
 
 
 @app.post("/trigger/{role}/{icao24}")
@@ -213,6 +257,15 @@ async def trigger_role(role: str, icao24: str, body: TriggerRoleRequest | None =
     if role_upper not in ROLE_NAMES:
         raise HTTPException(400, f"role must be one of {list(ROLE_NAMES)}, got {role!r}")
     context = body.context if body else None
+
+    if body and body.position:
+        p = body.position
+        async with _state["pool"].acquire() as conn:
+            await conn.execute(
+                _UPDATE_AIRCRAFT_POSITION_SQL,
+                p.longitude, p.latitude, p.baro_altitude_m, p.on_ground, p.velocity_mps, icao24,
+            )
+
     final_state = await _run_graph_for_role(role_upper, icao24, context)
     return await _final_response(final_state, icao24=icao24 if role_upper != "CLEARANCE" else None)
 
@@ -256,7 +309,13 @@ async def list_scenarios() -> dict:
                 "title": scenario["title"],
                 "description": scenario["description"],
                 "steps": [
-                    {"role": s["role"], "icao24": s["icao24"], "label": s["label"], "context": s["context"]}
+                    {
+                        "role": s["role"],
+                        "icao24": s["icao24"],
+                        "label": s["label"],
+                        "context": s["context"],
+                        "position": s.get("position"),
+                    }
                     for s in scenario["steps"]
                 ],
             }
