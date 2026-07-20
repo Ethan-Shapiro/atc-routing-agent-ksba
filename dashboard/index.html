@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>KSBA ATC — Live Dashboard</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <h1>Santa Barbara Municipal (KSBA) — 4-Role ATC Dashboard</h1>
+  <p class="subtitle">Real PostGIS geometry, real MCP tool grounding, real Claude Sonnet 5 decisions.</p>
+</header>
+
+<main>
+  <section id="map-section">
+    <svg id="airport-map" viewBox="0 0 600 400" preserveAspectRatio="xMidYMid meet"></svg>
+  </section>
+
+  <section id="controller-strip">
+    <div class="controller-box" data-role="CLEARANCE">
+      <div class="role-name">Clearance</div>
+      <div class="frequency">—</div>
+      <div class="latest-message">Idle</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="controller-box" data-role="GROUND">
+      <div class="role-name">Ground</div>
+      <div class="frequency">—</div>
+      <div class="latest-message">Idle</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="controller-box" data-role="TOWER">
+      <div class="role-name">Tower</div>
+      <div class="frequency">—</div>
+      <div class="latest-message">Idle</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="controller-box" data-role="APPROACH">
+      <div class="role-name">Approach</div>
+      <div class="frequency">—</div>
+      <div class="latest-message">Idle</div>
+    </div>
+  </section>
+
+  <section id="scenario-section">
+    <h2>Scenarios</h2>
+    <div id="scenario-list">Loading scenarios…</div>
+  </section>
+
+  <section id="transcript-section">
+    <h2>Transcript</h2>
+    <div id="transcript"></div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

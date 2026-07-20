@@ -1,0 +1,224 @@
+:root {
+  --bg: #0b0f14;
+  --panel: #121821;
+  --border: #263140;
+  --text: #d8e2ea;
+  --muted: #7c8a99;
+  --accent: #4ade80;
+  --accent-dim: #1f4d33;
+  --error: #f87171;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+
+header {
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  margin: 0 0 4px;
+  font-size: 1.3rem;
+}
+
+.subtitle {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+main {
+  max-width: 1000px;
+  margin: 0 auto;
+  padding: 20px 24px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+#map-section {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+
+#airport-map {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.runway-strip {
+  stroke: var(--muted);
+  stroke-width: 3;
+}
+
+.runway-threshold {
+  fill: var(--muted);
+}
+
+.runway-label {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: monospace;
+}
+
+.aircraft-marker {
+  fill: var(--accent);
+  stroke: #ffffff;
+  stroke-width: 1;
+}
+
+#controller-strip {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.controller-box {
+  flex: 1;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+  min-width: 0;
+}
+
+.controller-box.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 12px var(--accent-dim);
+}
+
+.role-name {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.frequency {
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-family: monospace;
+  margin-bottom: 6px;
+}
+
+.latest-message {
+  font-size: 0.8rem;
+  color: var(--text);
+  overflow-wrap: break-word;
+}
+
+.arrow {
+  align-self: center;
+  color: var(--muted);
+  font-size: 1.2rem;
+}
+
+#scenario-section h2,
+#transcript-section h2 {
+  margin: 0 0 10px;
+  font-size: 1rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+#scenario-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.scenario-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.scenario-title {
+  font-weight: 600;
+}
+
+.scenario-description {
+  color: var(--muted);
+  font-size: 0.8rem;
+  flex: 1;
+}
+
+.scenario-card button {
+  background: var(--accent-dim);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.scenario-card button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.scenario-card button:hover:not(:disabled) {
+  background: var(--accent);
+  color: #04150c;
+}
+
+#transcript {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  height: 320px;
+  overflow-y: auto;
+  font-family: "Cascadia Code", "Consolas", monospace;
+  font-size: 0.8rem;
+}
+
+.transcript-entry {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.transcript-entry:last-child {
+  border-bottom: none;
+}
+
+.transcript-header {
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+.transcript-entry.system .transcript-header {
+  color: var(--muted);
+}
+
+.transcript-entry.error .transcript-header {
+  color: var(--error);
+}
+
+.tool-call-line {
+  color: var(--muted);
+  padding-left: 12px;
+}
+
+.transcript-message {
+  padding-left: 12px;
+  white-space: pre-wrap;
+}

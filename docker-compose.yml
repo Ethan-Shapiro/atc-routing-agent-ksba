@@ -151,6 +151,10 @@ services:
     env_file: .env
     environment:
       MCP_SERVER_URL: http://mcp_server:8001/sse
+    # Dev convenience, same rationale as mcp_server's vector_db bind mount above: edit
+    # dashboard/ files live without rebuilding the image.
+    volumes:
+      - ./dashboard:/app/dashboard
     ports:
       - "8000:8000"
     networks:

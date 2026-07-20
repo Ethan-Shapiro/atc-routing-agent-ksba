@@ -22,14 +22,16 @@ import logging
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from pydantic import BaseModel
 
+import scenarios as scenario_catalog
 from config import settings
 from graph import build_graph
 from mcp_client import MCPToolClient, build_langchain_tools
-from roles import ROLE_NAMES
+from roles import ROLE_FACILITY_NAME, ROLE_FREQUENCY_MHZ, ROLE_NAMES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("agent-orchestration")
@@ -155,19 +157,42 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-def _final_response(final_state: dict) -> dict:
+def _tool_calls_trace(final_state: dict) -> list[dict]:
+    """Every tool call made across this run, in order — lets the dashboard show that a
+    decision was grounded in a real query_radar/query_faa_rules call (or a deterministic
+    check_runway_conflict/advance_to_next_role), not just plausible-sounding text."""
+    trace = []
+    for message in final_state["messages"]:
+        if isinstance(message, AIMessage):
+            for call in message.tool_calls or []:
+                trace.append({"name": call["name"], "args": call["args"]})
+    return trace
+
+
+async def _aircraft_position(icao24: str) -> dict | None:
+    async with _state["pool"].acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT longitude, latitude FROM aircraft_state_current WHERE icao24 = $1", icao24
+        )
+    return {"longitude": row["longitude"], "latitude": row["latitude"]} if row else None
+
+
+async def _final_response(final_state: dict, icao24: str | None = None) -> dict:
     return {
         "active_role": final_state["active_role"],
         "handoff_buffer": final_state["handoff_buffer"],
         "message_count": len(final_state["messages"]),
         "final_message": str(final_state["messages"][-1].content) if final_state["messages"] else None,
+        "tool_calls": _tool_calls_trace(final_state),
+        # None for CLEARANCE (the aircraft has no radar position yet — see module docstring).
+        "aircraft_position": await _aircraft_position(icao24) if icao24 else None,
     }
 
 
 @app.post("/trigger/{anomaly_id}")
 async def trigger_anomaly(anomaly_id: int) -> dict:
     """Manually run the graph for an existing anomaly_events row — for testing."""
-    return _final_response(await _run_graph_for_anomaly(anomaly_id))
+    return await _final_response(await _run_graph_for_anomaly(anomaly_id))
 
 
 class TriggerRoleRequest(BaseModel):
@@ -188,4 +213,69 @@ async def trigger_role(role: str, icao24: str, body: TriggerRoleRequest | None =
     if role_upper not in ROLE_NAMES:
         raise HTTPException(400, f"role must be one of {list(ROLE_NAMES)}, got {role!r}")
     context = body.context if body else None
-    return _final_response(await _run_graph_for_role(role_upper, icao24, context))
+    final_state = await _run_graph_for_role(role_upper, icao24, context)
+    return await _final_response(final_state, icao24=icao24 if role_upper != "CLEARANCE" else None)
+
+
+@app.get("/airport/layout")
+async def airport_layout() -> dict:
+    """Real runway geometry + role frequencies — the dashboard's only source of truth for
+    drawing the diagram, so it can't silently drift from the actual seeded PostGIS data."""
+    async with _state["pool"].acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT runway_id, heading_deg,
+                   ST_X(threshold_geom::geometry) AS threshold_lon,
+                   ST_Y(threshold_geom::geometry) AS threshold_lat,
+                   ST_X(ST_StartPoint(centerline_geom::geometry)) AS centerline_start_lon,
+                   ST_Y(ST_StartPoint(centerline_geom::geometry)) AS centerline_start_lat,
+                   ST_X(ST_EndPoint(centerline_geom::geometry)) AS centerline_end_lon,
+                   ST_Y(ST_EndPoint(centerline_geom::geometry)) AS centerline_end_lat,
+                   intersects_with
+            FROM runway
+            ORDER BY runway_id
+            """
+        )
+    return {
+        "airport_lat": settings.airport_lat,
+        "airport_lon": settings.airport_lon,
+        "runways": [dict(r) for r in rows],
+        "roles": [
+            {"role": role, "facility_name": ROLE_FACILITY_NAME[role], "frequency_mhz": ROLE_FREQUENCY_MHZ[role]}
+            for role in ROLE_NAMES
+        ],
+    }
+
+
+@app.get("/scenarios")
+async def list_scenarios() -> dict:
+    return {
+        "scenarios": [
+            {
+                "id": scenario_id,
+                "title": scenario["title"],
+                "description": scenario["description"],
+                "steps": [
+                    {"role": s["role"], "icao24": s["icao24"], "label": s["label"], "context": s["context"]}
+                    for s in scenario["steps"]
+                ],
+            }
+            for scenario_id, scenario in scenario_catalog.SCENARIOS.items()
+        ]
+    }
+
+
+@app.post("/scenarios/{scenario_id}/reset")
+async def reset_scenario(scenario_id: str) -> dict:
+    """Idempotently (re)seeds this scenario's synthetic aircraft — called by the dashboard
+    immediately before playing back a scenario's chain of /trigger calls."""
+    if scenario_id not in scenario_catalog.SCENARIOS:
+        raise HTTPException(404, f"Unknown scenario_id={scenario_id!r}")
+    await scenario_catalog.seed_scenario(_state["pool"], scenario_id)
+    return {"status": "seeded", "scenario_id": scenario_id}
+
+
+# Mounted last so it doesn't shadow the API routes above. dashboard/ is bind-mounted into
+# the container at /app/dashboard (WORKDIR is /app — see Dockerfile) for dev convenience,
+# same rationale as mcp_server's vector_db bind mount: edit dashboard files without a rebuild.
+app.mount("/dashboard", StaticFiles(directory="dashboard", html=True), name="dashboard")
