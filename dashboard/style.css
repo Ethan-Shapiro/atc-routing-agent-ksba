@@ -222,3 +222,8 @@ main {
   padding-left: 12px;
   white-space: pre-wrap;
 }
+
+.load-error {
+  color: var(--error);
+  font-size: 0.85rem;
+}

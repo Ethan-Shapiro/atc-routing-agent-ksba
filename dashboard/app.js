@@ -96,6 +96,7 @@ async function loadAirportLayout() {
 }
 
 function updateAircraftMarker(position) {
+  if (!aircraftMarker) return; // map failed to load — transcript/controller strip still work
   if (!position || !projection) {
     aircraftMarker.setAttribute("cx", -100);
     aircraftMarker.setAttribute("cy", -100);
@@ -221,6 +222,20 @@ async function loadScenarios() {
 }
 
 (async function init() {
-  await loadAirportLayout();
-  await loadScenarios();
+  // Independent try/catches: a map-loading failure (e.g. a transient DB hiccup) should
+  // never block the scenario list from loading, and vice versa — the two are unrelated
+  // features that both happen to fetch data on page load.
+  try {
+    await loadAirportLayout();
+  } catch (err) {
+    console.error("Failed to load airport layout:", err);
+    document.getElementById("map-section").innerHTML = `<p class="load-error">Failed to load airport diagram: ${err}</p>`;
+  }
+
+  try {
+    await loadScenarios();
+  } catch (err) {
+    console.error("Failed to load scenarios:", err);
+    document.getElementById("scenario-list").innerHTML = `<p class="load-error">Failed to load scenarios: ${err}</p>`;
+  }
 })();
