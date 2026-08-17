@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 from fastapi import FastAPI, HTTPException
@@ -31,6 +32,7 @@ import scenarios as scenario_catalog
 from config import settings
 from graph import build_graph
 from mcp_client import MCPToolClient, build_langchain_tools
+from replay import ReplayController
 from roles import ROLE_FACILITY_NAME, ROLE_FREQUENCY_MHZ, ROLE_NAMES
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -128,7 +130,7 @@ async def _handle_notification(anomaly_id: int) -> None:
 
 @app.on_event("startup")
 async def startup() -> None:
-    _state["pool"] = await asyncpg.create_pool(settings.postgres_dsn, min_size=1, max_size=5)
+    _state["pool"] = await asyncpg.create_pool(settings.postgres_dsn, min_size=1, max_size=8)
 
     mcp_client = MCPToolClient(settings.mcp_server_url)
     await mcp_client.connect()
@@ -147,11 +149,15 @@ async def startup() -> None:
         llm, mcp_tools, _state["pool"], airport_lat=settings.airport_lat, airport_lon=settings.airport_lon
     )
     _state["listener_task"] = asyncio.create_task(_listen_for_anomalies())
+    _state["replay"] = ReplayController(
+        _state["pool"], settings.postgres_dsn, settings.airport_lat, settings.airport_lon, _on_replay_event
+    )
     log.info("agent_orchestration ready (KSBA, 4-role)")
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    await _state["replay"].stop()
     _state["listener_task"].cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await _state["listener_task"]
@@ -308,6 +314,12 @@ async def list_scenarios() -> dict:
                 "id": scenario_id,
                 "title": scenario["title"],
                 "description": scenario["description"],
+                # Lets the dashboard animate the very first leg of a flight path — without
+                # this it has no "from" position until the first step's response arrives.
+                "seed_positions": {
+                    a["icao24"]: {"longitude": a["longitude"], "latitude": a["latitude"]}
+                    for a in scenario["seed_aircraft"]
+                },
                 "steps": [
                     {
                         "role": s["role"],
@@ -332,6 +344,191 @@ async def reset_scenario(scenario_id: str) -> dict:
         raise HTTPException(404, f"Unknown scenario_id={scenario_id!r}")
     await scenario_catalog.seed_scenario(_state["pool"], scenario_id)
     return {"status": "seeded", "scenario_id": scenario_id}
+
+
+# ----------------------------------------------------------------------------------------
+# Recorded-day replay (see replay.py). The dashboard's "Recorded Day" mode drives these.
+# ----------------------------------------------------------------------------------------
+
+# Caps how many uncached replay agent runs execute at once. The first pass through a window
+# can surface ~10 role transitions near-simultaneously; without a cap they'd all fire their
+# LLM calls together, hammer the pool + the API, and (before the dedicated replay connection)
+# starve the tick loop. 3 keeps the first pass brisk without a thundering herd.
+_replay_agent_semaphore = asyncio.Semaphore(3)
+
+
+def _replay_fingerprint(kind: str, icao24: str, role: str, replay_time: datetime) -> str:
+    """Content-derived, stable across loops: the same event recurs at the same replay-clock
+    instant every loop, so bucketing to 10s gives a key that hits the cache on loop 2+."""
+    bucket = int(replay_time.timestamp() // 10)
+    return f"{kind}:{icao24}:{role}@{bucket}"
+
+
+async def _on_replay_event(
+    kind: str, icao24: str, callsign: str | None, role: str, replay_time: datetime, prev_role: str | None
+) -> None:
+    """Called by the replay driver on a role transition (fire-and-forget). Cache-first: if
+    this exact event was already resolved on an earlier loop, reuse it and make no API call —
+    the mechanism that makes re-looping free."""
+    replay = _state["replay"]
+    session_id = replay.status()["session_id"]
+    if session_id is None:
+        return
+    fingerprint = _replay_fingerprint(kind, icao24, role, replay_time)
+
+    cached = await _state["pool"].fetchval(
+        "SELECT 1 FROM replay_agent_response WHERE session_id = $1 AND event_fingerprint = $2",
+        session_id, fingerprint,
+    )
+    if cached:
+        return  # already decided on a previous loop — no re-ping
+
+    context = (
+        f"{callsign or icao24} is now under your control ({role} phase"
+        + (f", handed off from {prev_role}" if prev_role else "") + ")."
+    )
+    try:
+        async with _replay_agent_semaphore:
+            final_state = await _run_graph_for_role(role, icao24, context)
+    except Exception:
+        log.exception("Replay agent run failed for icao24=%s role=%s", icao24, role)
+        return
+
+    final_message = _message_text(final_state["messages"][-1].content) if final_state["messages"] else None
+    tool_calls = _tool_calls_trace(final_state)
+    await _state["pool"].execute(
+        """
+        INSERT INTO replay_agent_response
+            (session_id, icao24, callsign, role, trigger_kind, event_fingerprint,
+             replay_time, final_message, tool_calls)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+        ON CONFLICT (session_id, event_fingerprint) DO NOTHING
+        """,
+        session_id, icao24, callsign, role, kind, fingerprint,
+        replay_time, final_message, json.dumps(tool_calls),
+    )
+
+
+@app.get("/replay/sessions")
+async def replay_sessions() -> dict:
+    rows = await _state["pool"].fetch(
+        """
+        SELECT s.id, s.label, s.started_at, s.ended_at,
+               (SELECT count(DISTINCT h.icao24) FROM aircraft_state_history h
+                WHERE h.time_position >= s.started_at AND h.time_position < s.ended_at
+                  AND h.is_commercial_ifr) AS ifr_aircraft
+        FROM recording_session s ORDER BY s.id DESC
+        """
+    )
+    return {"sessions": [dict(r) for r in rows]}
+
+
+class CreateSessionRequest(BaseModel):
+    label: str
+    last_minutes: float = 30.0
+
+
+@app.post("/replay/sessions")
+async def create_replay_session(body: CreateSessionRequest) -> dict:
+    """Convenience for the dashboard: label the most recent `last_minutes` of recorded
+    history as a session (the same thing data_pipeline/replay/record_session.py does)."""
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=body.last_minutes)
+    row = await _state["pool"].fetchrow(
+        "INSERT INTO recording_session (label, started_at, ended_at) VALUES ($1, $2, $3) RETURNING id",
+        body.label, start, end,
+    )
+    return {"id": row["id"], "label": body.label, "started_at": start.isoformat(), "ended_at": end.isoformat()}
+
+
+class StartReplayRequest(BaseModel):
+    speed: float = 60.0
+    loop: bool = True
+
+
+@app.post("/replay/{session_id}/start")
+async def start_replay(session_id: int, body: StartReplayRequest | None = None) -> dict:
+    body = body or StartReplayRequest()
+    try:
+        return await _state["replay"].start(session_id, speed=body.speed, loop=body.loop)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/replay/stop")
+async def stop_replay() -> dict:
+    await _state["replay"].stop()
+    return _state["replay"].status()
+
+
+@app.get("/replay/status")
+async def replay_status() -> dict:
+    return _state["replay"].status()
+
+
+@app.get("/replay/{session_id}/tracks")
+async def replay_tracks(session_id: int) -> dict:
+    """Full per-aircraft track set for the window — fetched once so the dashboard can
+    interpolate smooth motion locally against the replay clock, no per-frame round-trips."""
+    session = await _state["pool"].fetchrow(
+        "SELECT started_at, ended_at FROM recording_session WHERE id = $1", session_id
+    )
+    if session is None:
+        raise HTTPException(404, f"session {session_id} not found")
+    rows = await _state["pool"].fetch(
+        """
+        SELECT icao24, callsign, time_position, longitude, latitude,
+               on_ground, true_track_deg, baro_altitude_m
+        FROM aircraft_state_history
+        WHERE time_position >= $1 AND time_position < $2 AND is_commercial_ifr
+        ORDER BY icao24, time_position
+        """,
+        session["started_at"], session["ended_at"],
+    )
+    tracks: dict[str, dict] = {}
+    for r in rows:
+        t = tracks.setdefault(r["icao24"], {"icao24": r["icao24"], "callsign": r["callsign"], "points": []})
+        t["points"].append({
+            "t": r["time_position"].isoformat(),
+            "lon": r["longitude"], "lat": r["latitude"],
+            "on_ground": r["on_ground"], "track": r["true_track_deg"],
+        })
+    return {
+        "session_id": session_id,
+        "started_at": session["started_at"].isoformat(),
+        "ended_at": session["ended_at"].isoformat(),
+        "tracks": list(tracks.values()),
+    }
+
+
+@app.get("/replay/{session_id}/transmissions")
+async def replay_transmissions(session_id: int) -> dict:
+    """Time-ordered agent transmissions produced for this session so far. Stage 2 will merge
+    real controller transmissions into the same feed for side-by-side comparison."""
+    rows = await _state["pool"].fetch(
+        """
+        SELECT icao24, callsign, role, trigger_kind, replay_time, final_message, tool_calls
+        FROM replay_agent_response
+        WHERE session_id = $1 AND final_message IS NOT NULL
+        ORDER BY replay_time
+        """,
+        session_id,
+    )
+    return {
+        "transmissions": [
+            {
+                "source": "AGENT",
+                "icao24": r["icao24"],
+                "callsign": r["callsign"],
+                "role": r["role"],
+                "trigger_kind": r["trigger_kind"],
+                "replay_time": r["replay_time"].isoformat(),
+                "text": r["final_message"],
+                "tool_calls": json.loads(r["tool_calls"]) if isinstance(r["tool_calls"], str) else r["tool_calls"],
+            }
+            for r in rows
+        ]
+    }
 
 
 # Mounted last so it doesn't shadow the API routes above. dashboard/ is bind-mounted into

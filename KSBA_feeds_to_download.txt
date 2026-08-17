@@ -1,0 +1,23 @@
+LiveATC reference list for Santa Barbara Municipal (KSBA) — for future fine-tuning audio work
+(currently deferred, see README.md section 4). Matches the 4 real frequencies already baked
+into agent_orchestration/roles.py's ROLE_FREQUENCY_MHZ. Unlike LAX, KSBA is a single-complex
+airport — no North/South split, no multiple TRACON sectors — so this list is much shorter.
+
+1. Clearance Delivery
+KSBA Clearance Delivery (132.900): Initial IFR route clearances (CRAFT format) issued before
+pushback — the source for Clearance Delivery role training data.
+
+2. Ground Operations & Routing
+KSBA Ground (121.700): Taxi routing to/from the single set of runway complexes (7/25 for
+commercial jets, 15L/15R for GA), hold-short instructions, pushback clearances.
+
+3. Local Control (Tower)
+KSBA Tower (119.700): Takeoff/landing clearances for all runways, including the 15/33 x 7/25
+intersection safety calls (hold-short vs. cleared, traffic advisories) — the single most
+important source for Tower role training data, since that's this project's hardest
+implemented judgment call.
+
+4. TRACON (Arrivals & Departures)
+KSBA Approach (120.550): Airborne vectoring, speed assignments (the primary separation tool
+per this project's Approach rules), localizer handoffs to Tower, and departure climb-out
+check-ins.

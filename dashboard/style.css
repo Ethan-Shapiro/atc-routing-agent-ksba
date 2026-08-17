@@ -73,10 +73,32 @@ main {
   font-family: monospace;
 }
 
+.flight-trail {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-dasharray: 3 3;
+  opacity: 0.35;
+}
+
 .aircraft-marker {
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+
+.aircraft-icon {
   fill: var(--accent);
   stroke: #ffffff;
-  stroke-width: 1;
+  stroke-width: 0.75;
+  transform-origin: center;
+  transition: transform 0.3s ease, fill 0.3s ease;
+}
+
+/* On the ground taxiing rather than airborne — smaller and dimmer reads as "on the ramp"
+   without needing a second icon shape. */
+.aircraft-marker.on-ground .aircraft-icon {
+  fill: var(--muted);
+  transform: scale(0.75);
 }
 
 #controller-strip {
@@ -97,7 +119,32 @@ main {
 
 .controller-box.active {
   border-color: var(--accent);
-  box-shadow: 0 0 12px var(--accent-dim);
+  animation: on-air-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes on-air-pulse {
+  0%, 100% { box-shadow: 0 0 8px var(--accent-dim); }
+  50% { box-shadow: 0 0 18px 2px var(--accent-dim); }
+}
+
+.role-name {
+  position: relative;
+}
+
+.controller-box.active .role-name::after {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: on-air-dot 1.6s ease-in-out infinite;
+}
+
+@keyframes on-air-dot {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
 }
 
 .role-name {
@@ -226,4 +273,71 @@ main {
 .load-error {
   color: var(--error);
   font-size: 0.85rem;
+}
+
+.section-hint {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 0.7rem;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+#replay-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+#replay-controls select,
+#replay-controls button {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+#replay-session {
+  min-width: 220px;
+  flex: 1;
+}
+
+#replay-controls .ctl {
+  color: var(--muted);
+  font-size: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+#replay-play {
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+}
+
+#replay-controls button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.replay-clock {
+  font-family: monospace;
+  color: var(--accent);
+  font-size: 0.85rem;
+  margin-left: auto;
+}
+
+.replay-plane-label {
+  fill: var(--text);
+  font-size: 7px;
+  font-family: monospace;
+  opacity: 0.7;
 }

@@ -68,6 +68,26 @@ ORDER BY detected_at DESC
 """
 
 
+async def classify_roles(
+    conn: asyncpg.Connection, airport_lat: float, airport_lon: float
+) -> dict[str, dict[str, Any]]:
+    """Returns {icao24: {"role", "callsign"}} for every commercial-IFR aircraft currently in
+    aircraft_state_current, using the exact same phase-of-flight SQL the observation node uses.
+    Reused by the replay driver (agent_orchestration/replay.py) to detect role transitions —
+    keeping one classifier so the replay-triggered role and the role the agent then reasons as
+    can never drift apart."""
+    rows = await conn.fetch(
+        _CLASSIFY_AIRCRAFT_SQL,
+        airport_lon,
+        airport_lat,
+        TOWER_GROUND_PROXIMITY_NM,
+        TOWER_PATTERN_RADIUS_NM,
+        TOWER_PATTERN_ALTITUDE_AGL_FT,
+        FIELD_ELEVATION_FT,
+    )
+    return {r["icao24"]: {"role": r["flight_phase_role"], "callsign": r["callsign"]} for r in rows}
+
+
 def make_observation_builder(
     pool: asyncpg.Pool,
     airport_lat: float,

@@ -42,8 +42,28 @@
     </div>
   </section>
 
+  <section id="replay-section">
+    <h2>Recorded Day <span class="section-hint">— real KSBA traffic, looped, agents fire on real events</span></h2>
+    <div id="replay-controls">
+      <select id="replay-session"><option value="">Loading sessions…</option></select>
+      <label class="ctl">Speed
+        <select id="replay-speed">
+          <option value="30">30×</option>
+          <option value="60" selected>60×</option>
+          <option value="120">120×</option>
+          <option value="300">300×</option>
+        </select>
+      </label>
+      <label class="ctl"><input type="checkbox" id="replay-loop" checked /> Loop</label>
+      <button id="replay-play">▶ Play</button>
+      <button id="replay-stop" disabled>■ Stop</button>
+      <button id="replay-record">● Record last 30 min</button>
+      <span id="replay-clock" class="replay-clock">—</span>
+    </div>
+  </section>
+
   <section id="scenario-section">
-    <h2>Scenarios</h2>
+    <h2>Scenarios <span class="section-hint">— hand-scripted single-aircraft chains</span></h2>
     <div id="scenario-list">Loading scenarios…</div>
   </section>
 

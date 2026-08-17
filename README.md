@@ -1,82 +1,100 @@
-# Project Specification: Autonomous ATC Routing Agent (LAX Sector)
+     
+
+# Project Specification: Autonomous ATC Routing Agent (Santa Barbara Municipal — KSBA)
 
 ## 1. Project Objective & Core Concept
 
-**The Concept:** An autonomous Multi-Agent Reinforcement Learning (MARL) system that monitors live flight telemetry around Los Angeles International Airport (LAX). When a deterministic anomaly occurs (e.g., airspace encroachment, weather cell), the agents formulate safe, coordinated rerouting instructions using standard aviation phraseology.
-**The Problem:** Human controllers face extreme cognitive load during airspace disruptions. This acts as an AI "co-pilot," synthesizing radar data, weather, and complex FAA regulations into actionable commands instantly.
-**Defense & Aerospace Alignment:** This architecture directly mirrors autonomous systems operating in physical space (e.g., routing drone swarms around radar threats). It is designed as a portfolio cornerstone for advanced ML/Data Science roles within the defense and aerospace sectors, proving capability in distributed agent orchestration, deterministic safety guardrails, and real-time geospatial processing.
+**The Concept:** An autonomous multi-agent system that monitors live flight telemetry around Santa Barbara Municipal Airport (KSBA) and simulates the real ATC role chain — Clearance Delivery, Ground, Tower, and Approach — handing an aircraft off between roles the way real controllers do, grounded in live geospatial data and the actual FAA rulebook rather than hardcoded logic.
 
-## 2. The Tech Stack
+**The Problem:** Human controllers face extreme cognitive load during airspace disruptions and routine handoffs alike. This project explores whether an LLM-based agent, given real tool access (radar state, regulatory text) and deterministic safety guardrails where math is involved, can reason correctly across a full multi-role ATC workflow — not just format phraseology.
 
-* **AI/ML Core:** PyTorch, Hugging Face (QLoRA), Llama 3 (8B).
-* **Agentic Framework:** LangGraph (Multi-Agent StateGraph for North/South tower coordination).
-* **Interoperability:** Model Context Protocol (MCP) Python SDK.
-* **Data & Geospatial:** PostgreSQL with PostGIS extension, FAISS or Milvus (Vector Database).
-* **Infrastructure:** Apache Airflow (data ingestion), Docker & Docker Compose (microservices).
+**Defense & Aerospace Alignment:** This architecture mirrors autonomous systems operating in physical space (e.g., routing drone swarms around radar threats): distributed agent orchestration, deterministic safety guardrails layered under LLM judgment, and real-time geospatial processing. It's a portfolio cornerstone for ML/Data Science roles in defense and aerospace.
 
-## 3. The Data Sources (Free/Public)
+**Why KSBA, not LAX:** The project originally targeted LAX with a simpler 2-agent (North/South Tower) design coordinating over a geographic split. It was rescoped to Santa Barbara Municipal — a single airport with one real physical runway intersection (7/25 crossed by 15L/33R and 15R/33L) — because that's a cleaner, more precisely-modelable case for the 4-role sequential handoff design this project now implements, and because KSBA's real-world traffic (regional jets + heavy GA) is a better fit for a role-chain than LAX's dual-complex operation.
 
-* **Live Telemetry:** OpenSky Network API. Data will be strictly filtered to ingest **only commercial IFR (Instrument Flight Rules) flights**, ignoring VFR and helicopter traffic to ensure predictable state transitions.
-* **The Rulebook (RAG):** FAA Order JO 7110.65 (Air Traffic Control). The Vector DB must be structured to accurately retrieve complex matrix tables, specifically:
-  * *Wake Turbulence Recategorization (RECAT) Phase I/II* (6x6 matrix minimums).
-  * *Simultaneous Close Parallel Approaches (NTZ Breakout rules).*
-  * *Time-based departure intervals.*
-* **Fine-Tuning Data:** LiveATC.net archives. Isolated LAX feeds for Ground, Tower, and Final Approach. (e.g., North Tower 133.900, South Tower 119.800). No combined feeds.
+## 2. Current Status
 
----
+| Piece                                                                                                       | Status                                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PostGIS geospatial pipeline (schema, OpenSky poller, proximity-conflict trigger, Airflow housekeeping DAGs) | Built, live-verified against real OpenSky data                                                                                                          |
+| FAA rulebook RAG + MCP server (`query_radar`, `query_faa_rules`)                                        | Built, live-verified — FAISS index over JO 7110.65 (full) and JO 7360.1 (Ch. 1–2)                                                                     |
+| 4-role LangGraph orchestration (Clearance → Ground → Tower → Approach)                                   | Built, live-verified end-to-end against real PostGIS + MCP + Claude Sonnet 5                                                                            |
+| Tower's runway-intersection safety check (deterministic PostGIS distance query)                             | Built, live-verified in both directions (must-hold and should-clear)                                                                                    |
+| Live dashboard (airport diagram + scenario playback)                                                        | Built, live-verified                                                                                                                                    |
+| Offline reward scoring (Phase 5)                                                                            | Built for the old 2-agent design; the coordination term needs rework for the 4-role handoff model — see`evaluation/reward.py`'s documented known gap |
+| Fine-tuned phraseology model                                                                                | Deferred — see §4                                                                                                                                     |
+| Live auto-triggering for Ground/Tower/Approach off real state transitions                                   | Deferred (roadmap) — currently reached via a manual`/trigger/{role}/{icao24}` endpoint                                                               |
 
-## 4. Architectural Blueprint
+`ksba_prototype/` is a standalone sandbox (plain Anthropic SDK calls, no MCP/PostGIS) that validated Claude Sonnet 5's judgment quality on these 4 roles — including the intersection must-hold/should-clear contrast — before the real integrated system was built. It's kept as-is for reference; the production system's prompts were adapted from it.
 
-### Phase 1: The Geospatial Pipeline (PostGIS + Airflow)
+## 3. The Tech Stack
 
-Set up a PostGIS database. Write an Airflow DAG that polls the OpenSky API every 10 seconds for commercial flights within 50 miles of LAX. Upsert this data into PostGIS. Write deterministic SQL triggers to flag anomalies (e.g., `ST_Distance(plane1.geom, plane2.geom) < 3 nautical miles`).
+* **Agentic Framework:** LangGraph (`agent_orchestration/`) — 4 role-specific reasoning nodes, tool-bound to real MCP tools plus deterministic local tools (`finalize_instruction`, `advance_to_next_role`, Tower-only `check_runway_conflict`).
+* **LLM:** Claude Sonnet 5, via `langchain-anthropic`. Zero-shot judgment quality (validated in `ksba_prototype/`) has been strong enough that fine-tuning hasn't been necessary so far — see §4.
+* **Interoperability:** Model Context Protocol (MCP) Python SDK — `mcp_server/` runs as a long-lived SSE service, not a subprocess.
+* **Data & Geospatial:** PostgreSQL + PostGIS (`data_pipeline/`), FAISS (file-based vector index, no separate vector-DB service needed at this corpus size).
+* **Infrastructure:** Apache Airflow (minute-scale housekeeping only — not the hot-path poller, see §6's gotchas), Docker & Docker Compose.
+* **Dashboard:** Plain HTML/CSS/JS, no build step, served as static files directly from `agent_orchestration`'s FastAPI app (same-origin, no CORS needed).
+* **Deferred:** PyTorch/QLoRA fine-tuning — scaffolding (`model_finetuning/`) exists but is unused; see §4.
 
-### Phase 2: RAG & MCP Server Configuration
+## 4. On Fine-Tuning
 
-Chunk the FAA ATC rulebook (focusing on RECAT and NTZ matrices) into FAISS/Milvus. Use the Python `mcp` library to build a server exposing two primary tools to the LLMs:
+The original plan called for QLoRA fine-tuning Llama 3 on LiveATC transcripts to force strict FAA phraseology. In practice, `ksba_prototype/`'s validation (9 isolated scenarios plus full departure/arrival handoff chains) showed Claude Sonnet 5 already produces correct decisions and standards-compliant phraseology zero-shot, given real tool grounding and good system prompts — including the hardest test, the Tower intersection must-hold/should-clear contrast, which requires genuine spatial threshold reasoning rather than blanket caution.
 
-1. `query_radar(flight_id)`: Executes PostGIS spatial SQL to return precise aircraft vectors and wake categories.
-2. `query_faa_rules(topics)`: Executes a vector search to return specific separation minimums.
+Fine-tuning would still earn its keep for: lower latency/cost via a smaller model, authentic-sounding audio/voice output, or offline operation without an API dependency. None of those are blocking for what this project demonstrates, so it's parked as optional future work rather than a requirement. `model_finetuning/` stays scaffolded (and a local CUDA GPU is available) if that changes.
 
-### Phase 3: The Multi-Agent LangGraph Orchestration
+## 5. Architecture
 
-LAX operates as two parallel airports. The graph must implement a Centralized Training, Decentralized Execution (CTDE) architecture using two primary actors:
+### The 4-role chain
 
-* **North Tower Agent:** Manages Runways 24L/R, 6L/R, and northern taxiways.
-* **South Tower Agent:** Manages Runways 25L/R, 7L/R, and southern taxiways.
-* **The Routing Logic:** Agents operate in parallel on their own isolated state vectors. A conditional router checks if an action impacts the opposite complex. If so, a structured JSON contract is passed through an `inter_agent_buffer` (a shared state scratchpad) requiring an `ACK` from the opposing agent before phraseology is generated.
+* **Clearance Delivery** (132.9) — issues CRAFT-format IFR clearances before pushback. The only role that's structurally unreachable by live radar-based triggering: an aircraft awaiting clearance at the gate typically isn't broadcasting ADS-B yet. Reached only via the manual trigger endpoint.
+* **Ground** (121.7) — routes aircraft to their departure runway (commercial jets → 7/25, GA → 15L/15R), enforces hold-short + readback.
+* **Tower** (119.7) — sequences takeoffs/landings. Runways 15L/15R/33L/33R physically intersect 7/25 (real seeded geometry in the `runway` table); before clearing 15/33 traffic, Tower calls a deterministic `check_runway_conflict` tool — a real PostGIS distance query against intersecting-runway thresholds, not LLM-estimated distance — consistent with this project's "LLMs cannot do math" guardrail (§6).
+* **Approach** (120.55) — sequences inbound IFR traffic and accepts outbound climb-out check-ins, using speed control as the primary separation tool.
 
-### Phase 4: Domain-Specific Fine-Tuning (The ML Gap)
+Departures flow Clearance → Ground → Tower → Approach; arrivals flow Approach → Tower → Ground. A role hands off via `advance_to_next_role` with an **explicit** target role (not an implicit "next" lookup), so both directions work without special-casing. A handoff records a durable audit row (`coordination_events`) but does not re-invoke the next role's reasoning node in the same run — the next radio exchange happens via a separate trigger, same as real ATC handoffs are separate radio calls.
 
-Use PyTorch and QLoRA to fine-tune Llama 3 (8B) on the LiveATC transcripts. The objective is to override conversational defaults and force the model to output strict, unambiguous FAA phraseology (e.g., "Delta 123, LAX Tower, turn left heading 2-4-0, maintain 5,000 feet").
+### Grounding, not hardcoding
 
-### Phase 5: The Evaluation Reward Function
+Every reasoning node is bound to the same two MCP tools regardless of role: `query_radar` (live PostGIS aircraft state) and `query_faa_rules` (FAISS search over JO 7110.65 / JO 7360.1). Decisions are meant to come from real data and real regulatory text, not prompt-embedded assumptions — the dashboard's transcript panel shows exactly which tools were called for each decision.
 
-Implement a mathematical reward function to evaluate agent performance, prioritizing safety above all else:
+### Two trigger paths
 
-$$
-R_t = w_s R_{\text{safety}} + w_t R_{\text{throughput}} + w_e R_{\text{efficiency}} + w_c R_{\text{coordination}}
-$$
+1. **Automatic**, via Postgres `LISTEN/NOTIFY` on `anomaly_events` inserts — Tower's runway-intersection rule is itself an anomaly type (`PROXIMITY_CONFLICT`), so this path is live for Tower.
+2. **Manual**, via `POST /trigger/{role}/{icao24}` — the only way to reach Clearance, and the mechanism the dashboard uses to drive scenario playback. Live automatic triggering for Ground/Tower/Approach off real phase-of-flight transitions is roadmap, not yet built.
 
-Where $R_{\text{safety}}$ relies on a continuous exponential decay function that heavily penalizes agents as lateral distances drop below 3.0 NM or vertical distances drop below 1000 ft, modified by the specific RECAT wake turbulence category.
-
----
-
-## 5. Strategic Guardrails & Anti-Patterns
+## 6. Strategic Guardrails & Anti-Patterns
 
 ### What to Watch Out For (Gotchas)
 
-* **LLMs Cannot Do Math:** Language models fail at spatial geometry. Do not let the LLM guess a 30-degree offset. Provide a Python spatial calculator tool or PostGIS function to do the arithmetic.
-* **Rate Limits:** OpenSky will IP ban for polling faster than every 10 seconds. Implement strict throttling in the Airflow DAG.
-* **Strict Agent Boundaries:** Never allow the North Agent to directly issue a command to a South Agent aircraft. All cross-boundary operations must go through the `inter_agent_buffer`.
+* **LLMs Cannot Do Math:** Never let the LLM estimate a distance or threshold. Tower's runway-intersection check and the Phase 1 proximity-conflict trigger are both real PostGIS queries, not model inference.
+* **Rate Limits:** OpenSky throttles aggressively. The poller uses a configurable interval (default 12s, not naively 10s) plus an active daily-credit-budget guard — see `data_pipeline/poller/`.
+* **Strict Role Boundaries:** A reasoning node never fabricates an aircraft identity or acts on another role's aircraft. `main.py` passes the real ICAO24 explicitly into every seed message — a callsign alone isn't enough to safely bind to a database row (this was a real bug, not a hypothetical: an early dashboard trial had a role query and act on a completely unrelated aircraft because it had to guess).
 
 ### What is Important to Remember
 
-* **Backend > UI:** Do not build a React frontend. Engineering focus must remain entirely on Docker container stability, LangGraph state transition logic, pipeline latency, and rigorous logging (audit trails are mandatory in aerospace).
-* **Tool Binding over Hardcoding:** Use MCP properly to prove knowledge of standardized, secure tool integrations, rather than writing custom API glue code in the main execution loop.
+* **Backend > heavy UI, but visibility matters:** The dashboard exists because watching raw curl/JSON output isn't a real way to evaluate agent behavior — but it stays a static, no-build-step, framework-free page specifically so it doesn't become the project's engineering focus. The work is still Docker container stability, LangGraph state transition logic, and audit trails.
+* **Tool Binding over Hardcoding:** MCP tools are the only way reasoning nodes touch radar/rules data — no custom API glue in the main execution loop.
+* **Audit trails are mandatory:** every handoff and every deterministic safety check writes a durable row to `coordination_events`, not just ephemeral LangGraph state.
 
 ### What NOT to Do
 
-* **DO NOT build an ML anomaly detector:** Stick to hard-coded PostGIS SQL rules to trigger the agent. Training a separate model just to detect the anomalies dilutes the project's focus on Agentic AI.
-* **DO NOT train large models:** Stick to 8B parameter models with quantization (QLoRA). Do not attempt to load a 70B model locally.
-* **DO NOT include VFR/Helicopters:** Exclude all general aviation. Mixed traffic introduces unpredictable state transitions that will prevent the agents from converging on optimal policies.
+* **DO NOT build an ML anomaly detector:** Proximity conflicts are flagged by hard-coded PostGIS SQL triggers, not a trained model.
+* **DO NOT train large models:** If fine-tuning happens, stay at 8B-parameter scale with quantization.
+* **DO NOT include VFR/Helicopters in the commercial-IFR pipeline:** filtered out at ingest (`is_commercial_ifr`); GA is only ever in scope as Ground/Tower's traffic-type distinction (C172/PA28 vs. regional jets), not as pipeline noise.
+
+## 7. Running It
+
+```
+docker compose up -d                                   # postgis + Airflow + OpenSky poller
+docker compose --profile phase3 up -d --build mcp_server agent_orchestration
+```
+
+Then open **http://localhost:8000/dashboard/** for the live scenario dashboard, or drive it directly:
+
+```
+curl -X POST http://localhost:8000/scenarios/standard_departure/reset
+curl -X POST http://localhost:8000/trigger/clearance/ksba01 -d '{"context": "..."}'
+```
+
+`docker compose --profile phase5 run --rm evaluation python score_episode.py --start <iso> --end <iso>` runs offline reward scoring (safety/throughput/efficiency components only — see §2's known gap on coordination scoring).
