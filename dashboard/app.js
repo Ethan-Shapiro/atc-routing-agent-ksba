@@ -134,10 +134,10 @@ function resetMarker(lonLat) {
   flightTrail.setAttribute("points", trailPoints.join(" "));
 }
 
-// Eases the marker from its current position to lonLat over durationMs, resolving once the
-// motion finishes. Runs independent of (in parallel with) the actual network request — see
-// LEG_DURATION_MS's comment. Safe to call with null (nothing to animate toward, e.g. a
-// Clearance Delivery step where the aircraft has no radar position).
+// Eases the marker from its current position to lonLat over durationMs. Fire-and-forget —
+// see runStep's comment on why nothing awaits this promise for correctness. Safe to call with
+// null (nothing to animate toward, e.g. a Clearance Delivery step where the aircraft has no
+// radar position).
 function animateMarkerTo(lonLat, durationMs, onGround) {
   if (!aircraftGroup || !projection || !lonLat) return Promise.resolve();
 
@@ -146,8 +146,18 @@ function animateMarkerTo(lonLat, durationMs, onGround) {
   const angle = headingDeg(start, target);
   aircraftGroup.style.opacity = "1";
 
-  if (start.x === target.x && start.y === target.y) {
+  function snapToTarget() {
+    currentSvgPos = target;
+    trailPoints.push(`${target.x},${target.y}`);
+    flightTrail.setAttribute("points", trailPoints.join(" "));
     setMarkerTransform(target, angle, onGround);
+  }
+
+  // Nothing to animate toward if already there, or if the tab is hidden — requestAnimationFrame
+  // doesn't fire on a hidden tab, so there's no point starting a loop that won't render; snap
+  // straight to the end position instead.
+  if ((start.x === target.x && start.y === target.y) || document.hidden) {
+    snapToTarget();
     return Promise.resolve();
   }
 
@@ -161,9 +171,7 @@ function animateMarkerTo(lonLat, durationMs, onGround) {
       if (t < 1) {
         requestAnimationFrame(tick);
       } else {
-        currentSvgPos = target;
-        trailPoints.push(`${target.x},${target.y}`);
-        flightTrail.setAttribute("points", trailPoints.join(" "));
+        snapToTarget();
         resolve();
       }
     }
@@ -213,20 +221,23 @@ async function runStep(step) {
   setActiveRole(step.role);
   appendTranscript({ kind: "pending", header: `${step.role} — ${step.label}…`, message: step.context || "" });
 
-  const fetchPromise = fetch(`/trigger/${step.role.toLowerCase()}/${step.icao24}`, {
+  // Kicked off in parallel with the real API call, not after it — the plane is "flying"
+  // while the radio exchange is in progress, same as real ATC. Deliberately NOT awaited
+  // alongside the fetch, though: it resolves via requestAnimationFrame, which a hidden or
+  // merely-occluded browser tab can throttle indefinitely with no event this page can observe
+  // (visibilitychange only fires for actual tab-switches, not window occlusion) — gating
+  // scenario progression on it risks freezing the whole run with no error and no way to
+  // recover short of a reload. A plane that's a few seconds behind its radio call is a much
+  // smaller problem than that, so only the fetch decides when to move on.
+  if (step.position) {
+    animateMarkerTo(step.position, LEG_DURATION_MS, step.position.on_ground);
+  }
+
+  const res = await fetch(`/trigger/${step.role.toLowerCase()}/${step.icao24}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ context: step.context, position: step.position || null }),
   });
-  // Kicked off in parallel with the real API call, not after it — the plane is "flying"
-  // while the radio exchange is in progress, same as real ATC. If the fetch resolves first,
-  // Promise.all still waits for the animation to finish before the transcript updates, so
-  // the visual and the text never contradict each other.
-  const animatePromise = step.position
-    ? animateMarkerTo(step.position, LEG_DURATION_MS, step.position.on_ground)
-    : Promise.resolve();
-
-  const [res] = await Promise.all([fetchPromise, animatePromise]);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`${step.role} step failed (${res.status}): ${text}`);
