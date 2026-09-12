@@ -21,7 +21,8 @@
 | 4-role LangGraph orchestration (Clearance → Ground → Tower → Approach)                                   | Built, live-verified end-to-end against real PostGIS + MCP + Claude Sonnet 5                                                                            |
 | Tower's runway-intersection safety check (deterministic PostGIS distance query)                             | Built, live-verified in both directions (must-hold and should-clear)                                                                                    |
 | Live dashboard (airport diagram + scenario playback)                                                        | Built, live-verified                                                                                                                                    |
-| Offline reward scoring (Phase 5)                                                                            | Built for the old 2-agent design; the coordination term needs rework for the 4-role handoff model — see`evaluation/reward.py`'s documented known gap |
+| Recorded-day replay (label a window of real traffic, loop it, agents fire on real role transitions)         | Built, live-verified — see `agent_orchestration/replay.py`                                                                                             |
+| Offline reward scoring (Phase 5)                                                                            | Built for the old 2-agent design; currently broken for the 4-role model — `compute_coordination_reward` queries the retired `runway_complex` table, so `score_episode.py` throws on any invocation. See`evaluation/reward.py`'s documented known gap |
 | Fine-tuned phraseology model                                                                                | Deferred — see §4                                                                                                                                     |
 | Live auto-triggering for Ground/Tower/Approach off real state transitions                                   | Deferred (roadmap) — currently reached via a manual`/trigger/{role}/{icao24}` endpoint                                                               |
 
@@ -63,6 +64,10 @@ Every reasoning node is bound to the same two MCP tools regardless of role: `que
 1. **Automatic**, via Postgres `LISTEN/NOTIFY` on `anomaly_events` inserts — Tower's runway-intersection rule is itself an anomaly type (`PROXIMITY_CONFLICT`), so this path is live for Tower.
 2. **Manual**, via `POST /trigger/{role}/{icao24}` — the only way to reach Clearance, and the mechanism the dashboard uses to drive scenario playback. Live automatic triggering for Ground/Tower/Approach off real phase-of-flight transitions is roadmap, not yet built.
 
+### Recorded-day replay
+
+`data_pipeline/replay/record_session.py` labels a `[start, end)` window of already-recorded `aircraft_state_history` as a `recording_session` — recording itself is just the poller running continuously, so this is a naming step, not a separate capture mode. `agent_orchestration/replay.py`'s `ReplayController` then plays that window back on a clock, re-populating `aircraft_state_current` tick by tick so the *real* pipeline fires against real traffic: the same proximity-conflict trigger, `LISTEN/NOTIFY` path, and phase-of-flight role classifier used for live data, unchanged. Role transitions detected during playback (an arrival crossing from Approach's range into Tower's, etc.) are turned into real agent runs; each decision is cached by a content-derived fingerprint, so the first pass through a window costs one API call per event and every subsequent loop is free. The dashboard's "Recorded Day" panel drives this end-to-end (record, select a session, play at up to 300×, loop); it's also reachable directly via the `/replay/*` endpoints in `agent_orchestration/main.py`.
+
 ## 6. Strategic Guardrails & Anti-Patterns
 
 ### What to Watch Out For (Gotchas)
@@ -97,4 +102,12 @@ curl -X POST http://localhost:8000/scenarios/standard_departure/reset
 curl -X POST http://localhost:8000/trigger/clearance/ksba01 -d '{"context": "..."}'
 ```
 
-`docker compose --profile phase5 run --rm evaluation python score_episode.py --start <iso> --end <iso>` runs offline reward scoring (safety/throughput/efficiency components only — see §2's known gap on coordination scoring).
+For recorded-day replay, label a window of already-polled traffic from the host (connects to PostGIS on the mapped `localhost:5432`, no container exec needed):
+
+```
+python data_pipeline/replay/record_session.py --label "morning arrivals" --last-minutes 30
+```
+
+then pick it from the dashboard's "Recorded Day" panel and hit Play, or drive it directly via `POST /replay/{session_id}/start`.
+
+`docker compose --profile phase5 run --rm evaluation python score_episode.py --start <iso> --end <iso>` runs offline reward scoring — safety/throughput/efficiency only; the coordination component currently raises (see §2's known gap).
